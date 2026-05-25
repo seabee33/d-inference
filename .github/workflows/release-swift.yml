@@ -377,7 +377,12 @@ jobs:
             echo "Provisioning profile embedded in app bundle"
           fi
 
-          # Hardened-runtime sign each binary, then the bundle.
+          # Hardened-runtime sign each binary and resource, then the bundle.
+          # mlx.metallib must be signed before the bundle or codesign rejects
+          # it as an unsigned subcomponent.
+          codesign --force --options runtime --timestamp \
+            --keychain "$KEYCHAIN_PATH" \
+            --sign "$DEVELOPER_ID" "$APP/Contents/MacOS/mlx.metallib"
           codesign --force --options runtime --timestamp \
             --entitlements provider-swift/entitlements.plist \
             --keychain "$KEYCHAIN_PATH" \
