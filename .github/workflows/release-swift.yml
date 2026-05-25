@@ -198,8 +198,8 @@ jobs:
           fi
           aws --version
 
-      - name: Cache SwiftPM artifacts
-        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      - name: Restore SwiftPM cache
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             ~/Library/Caches/org.swift.swiftpm
@@ -252,6 +252,16 @@ jobs:
           test -x "$BIN_DIR/$ENCLAVE_NAME"
           echo "BIN_DIR=$BIN_DIR" >> "$GITHUB_ENV"
           ls -la "$BIN_DIR" | head -50
+
+      - name: Save SwiftPM cache
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        if: always()
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/org.swift.swiftpm
+            provider-swift/.build
+          key: spm-v1-${{ runner.os }}-${{ hashFiles('provider-swift/Package.resolved', 'libs/mlx-swift/Package.swift', 'libs/mlx-swift-lm/Package.swift') }}
 
       # Unit tests are run by CI (ci.yml + integration.yml) on push to
       # master. Skipped here to avoid flaky live MLX inference tests
