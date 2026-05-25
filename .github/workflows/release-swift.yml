@@ -393,7 +393,12 @@ jobs:
           codesign --force --options runtime --timestamp \
             --keychain "$KEYCHAIN_PATH" \
             --sign "$DEVELOPER_ID" "$APP/Contents/MacOS/mlx.metallib"
+          # darkbloom-enclave must use the bundle identifier so AMFI can
+          # match it against the embedded provisioning profile. Without this
+          # the binary gets identifier "darkbloom-enclave" which doesn't match
+          # the profile's SLDQ2GJ6TL.io.darkbloom.provider and macOS kills it.
           codesign --force --options runtime --timestamp \
+            --identifier io.darkbloom.provider \
             --entitlements provider-swift/entitlements.plist \
             --keychain "$KEYCHAIN_PATH" \
             --sign "$DEVELOPER_ID" "$APP/Contents/MacOS/$ENCLAVE_NAME"
