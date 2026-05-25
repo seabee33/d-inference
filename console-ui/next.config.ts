@@ -29,6 +29,7 @@ const securityHeaders = [
 ];
 
 const nextConfig: NextConfig = {
+  allowedDevOrigins: ["127.0.0.1"],
   typescript: {
     // @noble/curves >=1.9 ships raw .ts files with .ts import extensions,
     // which fails Next.js type-checking even with skipLibCheck: true.
