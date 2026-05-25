@@ -292,11 +292,19 @@ jobs:
 
           ents = p.get('Entitlements', {})
           groups = ents.get('keychain-access-groups', [])
-          if 'SLDQ2GJ6TL.io.darkbloom.provider' not in groups:
-              errors.append(f"keychain-access-groups missing SLDQ2GJ6TL.io.darkbloom.provider: {groups}")
+          # Accept exact match or wildcard (SLDQ2GJ6TL.*) which covers
+          # SLDQ2GJ6TL.io.darkbloom.provider at runtime.
+          has_group = any(
+              g == 'SLDQ2GJ6TL.io.darkbloom.provider' or g == 'SLDQ2GJ6TL.*'
+              for g in groups
+          )
+          if not has_group:
+              errors.append(f"keychain-access-groups missing SLDQ2GJ6TL.io.darkbloom.provider or wildcard: {groups}")
 
           app_id = ents.get('application-identifier', '')
-          if not app_id.endswith('io.darkbloom.provider'):
+          # Developer ID profiles may omit application-identifier entirely;
+          # accept empty or wildcard alongside exact match.
+          if app_id and not (app_id.endswith('io.darkbloom.provider') or app_id.endswith('*')):
               errors.append(f"application-identifier mismatch: {app_id}")
 
           expiry = p.get('ExpirationDate')
