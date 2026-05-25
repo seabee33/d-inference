@@ -238,22 +238,7 @@ jobs:
           ls -lh "$METALLIB"
 
       # ----------------------------------------------------------------------
-      # Download the tiny test model used by InferenceLiveTests. The
-      # `mlx-community/Qwen3-0.6B-8bit` model is ~600 MB and seeds
-      # ~/.cache/huggingface/hub so `ModelScanner.resolveLocalPath` finds
-      # it. We pin the snapshot to keep CI deterministic across reruns.
-      # ----------------------------------------------------------------------
-      - name: Download tiny test model for live MLX tests
-        run: |
-          set -euo pipefail
-          /tmp/mlxvenv/bin/pip install --quiet --no-cache-dir 'huggingface_hub[cli]'
-          /tmp/mlxvenv/bin/hf download mlx-community/Qwen3-0.6B-8bit \
-            --revision main \
-            > /dev/null
-          ls "${HOME}/.cache/huggingface/hub/" | head -20
-
-      # ----------------------------------------------------------------------
-      # Build + test in one shot.
+      # Build (tests run by CI, not the release workflow).
       # ----------------------------------------------------------------------
 
       - name: Build provider-swift (release)
