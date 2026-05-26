@@ -41,7 +41,10 @@ public actor BatchScheduler {
 
     let maxConcurrentRequests: Int
     let pendingTimeout: Duration
-    let defaultMaxTokens: Int
+    /// Default max output tokens when the consumer omits `max_tokens`.
+    /// Starts at the init value (typically 4096) and is raised post-load
+    /// when the model's context length is known.
+    var defaultMaxTokens: Int
     let kvBudget: GlobalKVCacheBudget?
     let adaptiveCapPolicy = AdaptiveBatchCapPolicy.default
 
@@ -52,6 +55,10 @@ public actor BatchScheduler {
     var modelWeightBytes: Int = 0
     var kvBytesPerToken: Int = 400_000
     var dynamicTokenBudgetMax: Int = 0
+    /// The model's maximum context window read from config.json
+    /// (`max_position_embeddings`). Used to size `maxTokensPerBatch`
+    /// so prompts up to the model's context length are admissible.
+    var maxContextLength: Int = 0
     var tokenizer: TokenizerHandle?
     var engine: BatchedEngine?
 
@@ -94,6 +101,9 @@ public actor BatchScheduler {
 
     // MARK: - Init
 
+    /// The init-time default; restored on `stopCurrentEngine()`.
+    private let initDefaultMaxTokens: Int
+
     public init(
         maxConcurrentRequests: Int = 4,
         pendingTimeout: Duration = .seconds(120),
@@ -103,6 +113,7 @@ public actor BatchScheduler {
         self.maxConcurrentRequests = max(1, maxConcurrentRequests)
         self.pendingTimeout = pendingTimeout
         self.defaultMaxTokens = defaultMaxTokens
+        self.initDefaultMaxTokens = defaultMaxTokens
         self.kvBudget = kvBudget
         self.dynamicMaxConcurrentRequests = min(4, max(1, maxConcurrentRequests))
     }
@@ -248,6 +259,17 @@ public actor BatchScheduler {
         } else {
             self.dynamicTokenBudgetMax = 1024
         }
+
+        // Derive context-aware limits from config.json.
+        self.maxContextLength = snapshot.architecture.maxContextLength ?? 0
+        if maxContextLength > 0 {
+            // Raise the default max output tokens so consumers that omit
+            // `max_tokens` get a reasonable budget for the model's class.
+            // Cap at 8192 so we don't over-reserve with very-long-context
+            // models (e.g. 131K Qwen).
+            self.defaultMaxTokens = min(maxContextLength, 8192)
+        }
+
         self.dynamicMaxConcurrentRequests = min(4, maxConcurrentRequests)
         self.performanceByBatchSize.removeAll()
         self.lastBatchSampleAt = .now
@@ -580,6 +602,8 @@ public actor BatchScheduler {
         modelId = ""
         kvBytesPerToken = 400_000
         dynamicTokenBudgetMax = 0
+        maxContextLength = 0
+        defaultMaxTokens = initDefaultMaxTokens
         planner = nil
         observedDecodeTpsEwma = 0
         ewmaInitialized = false
@@ -613,7 +637,7 @@ public actor BatchScheduler {
                 maxConcurrentRequests: maxConcurrentRequests,
                 maxQueuedRequests: 128,
                 maxActiveTokenBudget: activeTokenBudget,
-                maxTokensPerBatch: 4096
+                maxTokensPerBatch: resolvedMaxTokensPerBatch(activeTokenBudget: activeTokenBudget)
             )
         )
     }
@@ -624,7 +648,7 @@ public actor BatchScheduler {
             maxConcurrentRequests: maxConcurrentRequests,
             maxQueuedRequests: 128,
             maxActiveTokenBudget: activeTokenBudget,
-            maxTokensPerBatch: 4096
+            maxTokensPerBatch: resolvedMaxTokensPerBatch(activeTokenBudget: activeTokenBudget)
         )
         let snapshot = await planner.snapshot()
         guard snapshot.policy != updatedPolicy else { return }
@@ -637,6 +661,16 @@ public actor BatchScheduler {
         guard snapshot.pendingRequests.isEmpty,
               snapshot.activeRequests.isEmpty else { return }
         await planner.updatePolicy(updatedPolicy)
+    }
+
+    /// Derive the per-request prompt admission limit from the model's
+    /// context window. Falls back to 8192 when `config.json` is missing
+    /// or doesn't declare `max_position_embeddings`. Capped by the live
+    /// token budget so we never admit a prompt that couldn't possibly
+    /// fit in memory.
+    private func resolvedMaxTokensPerBatch(activeTokenBudget: Int) -> Int {
+        let contextBased = maxContextLength > 0 ? maxContextLength : 8192
+        return min(contextBased, max(activeTokenBudget, 1))
     }
 
     // Static helpers live in adjacent extensions:

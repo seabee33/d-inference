@@ -1697,7 +1697,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 					pr.Timing.FirstChunkAt = time.Now()
 					committed = true
 				} else {
-					// Closed — check for error (same race as above).
+					// Closed — check for error. Use a short grace
+					// period instead of a non-blocking default to
+					// close the race where Go's select picks the
+					// ChunkCh close before the ErrorCh value (sent
+					// by the provider handler before closing ChunkCh).
 					select {
 					case errMsg := <-pr.ErrorCh:
 						excludeProviders[provider.ID] = struct{}{}
@@ -1725,7 +1729,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 						provider = nil
 						pr = nil
 						continue
-					default:
+					case <-time.After(50 * time.Millisecond):
 						committed = true
 					}
 				}
