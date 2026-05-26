@@ -93,7 +93,7 @@ func loadRuntimeSnapshot(configPath rawPath: String?) throws -> RuntimeSnapshot 
         hardwareError = error
     }
 
-    let config: ProviderConfig
+    var config: ProviderConfig
     if configFileExists {
         config = try ConfigManager.load(from: configPath)
     } else if let hardware {
@@ -101,6 +101,9 @@ func loadRuntimeSnapshot(configPath rawPath: String?) throws -> RuntimeSnapshot 
     } else {
         config = ConfigManager.loadDefault()
     }
+
+    // Auto-migrate stale config values (idempotent, best-effort).
+    config = migrateConfigIfNeeded(configPath: configPath, config: config)
 
     let models = hardware.map { ModelScanner.scanModels(hardwareInfo: $0) } ?? []
 
@@ -119,6 +122,110 @@ private func resolveConfigPath(_ rawPath: String?) throws -> URL {
         return URL(fileURLWithPath: (rawPath as NSString).expandingTildeInPath)
     }
     return try ConfigManager.defaultConfigPath()
+}
+
+// MARK: - Config Migration
+
+/// Production coordinator WebSocket URL.
+private let productionCoordinatorURL = "wss://api.darkbloom.dev/ws/provider"
+
+/// Stale coordinator URLs to rewrite, ordered longest-first so a
+/// `/ws/provider`-suffixed variant is replaced before its bare host form.
+private let staleCoordinatorURLs: [(pattern: String, label: String)] = [
+    ("ws://localhost:8080/ws/provider", "localhost"),
+    ("http://localhost:8080/ws/provider", "localhost"),
+    ("wss://api.dev.darkbloom.xyz/ws/provider", "api.dev.darkbloom.xyz"),
+    ("ws://localhost:8080", "localhost"),
+    ("http://localhost:8080", "localhost"),
+    ("wss://api.dev.darkbloom.xyz", "api.dev.darkbloom.xyz"),
+]
+
+/// Migrate stale config values in-place. Runs on every startup; idempotent.
+///
+/// 1. **Legacy path**: if the resolved config lives at a non-canonical path
+///    and `~/.config/darkbloom/provider.toml` does not exist yet, copy the
+///    file there (keeping the old one for backward compat).
+/// 2. **Coordinator URL**: if the TOML text contains a known stale
+///    coordinator URL (localhost, dev), rewrite it to production in-place.
+func migrateConfigIfNeeded(configPath: URL, config: ProviderConfig) -> ProviderConfig {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: configPath.path) else { return config }
+
+    let home = fm.homeDirectoryForCurrentUser
+    let canonicalPath = home
+        .appendingPathComponent(".config")
+        .appendingPathComponent("darkbloom")
+        .appendingPathComponent("provider.toml")
+
+    // --- 1. Legacy path → canonical path copy ---
+    var copiedToCanonical = false
+    if configPath.standardizedFileURL != canonicalPath.standardizedFileURL
+        && !fm.fileExists(atPath: canonicalPath.path) {
+        do {
+            let dir = canonicalPath.deletingLastPathComponent()
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try fm.copyItem(at: configPath, to: canonicalPath)
+            copiedToCanonical = true
+            printError("  Migrated config to \(canonicalPath.path)")
+        } catch {
+            // best-effort; don't block startup
+        }
+    }
+
+    // --- 2. Coordinator URL migration ---
+    var didMigrateURL = false
+    var migratedLabel: String?
+
+    // Migrate the file we loaded from.
+    if let label = rewriteStaleURLs(in: configPath) {
+        didMigrateURL = true
+        migratedLabel = label
+    }
+
+    // If we just copied to canonical, fix URLs there too so the next
+    // startup (which will resolve to canonical first) is already clean.
+    if copiedToCanonical {
+        if let label = rewriteStaleURLs(in: canonicalPath) {
+            didMigrateURL = true
+            migratedLabel = migratedLabel ?? label
+        }
+    }
+
+    if didMigrateURL {
+        let source = migratedLabel ?? "stale URL"
+        printError("  Migrated coordinator URL from \(source) to api.darkbloom.dev")
+        var updated = config
+        updated.coordinator.url = productionCoordinatorURL
+        return updated
+    }
+
+    return config
+}
+
+/// Replace stale coordinator URLs in a TOML file via string replacement.
+/// Returns the human-readable label of the matched pattern, or `nil` if
+/// the file was already clean.
+private func rewriteStaleURLs(in path: URL) -> String? {
+    guard var content = try? String(contentsOf: path, encoding: .utf8) else {
+        return nil
+    }
+
+    var matched: String?
+    for (old, label) in staleCoordinatorURLs {
+        if content.contains(old) {
+            content = content.replacingOccurrences(of: old, with: productionCoordinatorURL)
+            matched = label
+        }
+    }
+
+    guard let matched else { return nil }
+
+    do {
+        try content.write(to: path, atomically: true, encoding: .utf8)
+        return matched
+    } catch {
+        return nil
+    }
 }
 
 func describeConfigPath(_ snapshot: RuntimeSnapshot) -> String {
