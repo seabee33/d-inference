@@ -36,6 +36,8 @@ type registerModelRequest struct {
 	RuntimeParameters map[string]any `json:"runtime_parameters"`
 	Metadata          map[string]any `json:"metadata"`
 	Promote           bool           `json:"promote"`
+	InputPrice        int64          `json:"input_price"`  // micro-USD per 1M tokens (required)
+	OutputPrice       int64          `json:"output_price"` // micro-USD per 1M tokens (required)
 }
 
 type publishingActor struct {
@@ -142,6 +144,13 @@ func (s *Server) handleRegisterModel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errorResponse("internal_error", "failed to save model version"))
 		return
 	}
+	// Set platform pricing for this model.
+	if err := s.store.SetModelPrice("platform", req.ModelID, req.InputPrice, req.OutputPrice); err != nil {
+		s.logger.Error("model registry: set pricing failed", "model_id", req.ModelID, "error", err)
+		writeJSON(w, http.StatusInternalServerError, errorResponse("internal_error", "model registered but failed to set pricing"))
+		return
+	}
+
 	if req.Promote {
 		if err := s.store.PromoteModelVersion(req.ModelID, req.Version); err != nil {
 			s.logger.Error("model registry: promote after register failed", "model_id", req.ModelID, "version", req.Version, "error", err)
@@ -152,10 +161,12 @@ func (s *Server) handleRegisterModel(w http.ResponseWriter, r *http.Request) {
 	s.SyncModelCatalog()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":  "registered",
-		"model":   entry,
-		"version": version,
-		"files":   len(files),
+		"status":       "registered",
+		"model":        entry,
+		"version":      version,
+		"files":        len(files),
+		"input_price":  req.InputPrice,
+		"output_price": req.OutputPrice,
 	})
 }
 
@@ -329,6 +340,12 @@ func validateRegisterModelRequest(req registerModelRequest) error {
 	}
 	if req.MinRAMGB <= 0 {
 		return fmt.Errorf("min_ram_gb must be greater than zero")
+	}
+	if req.InputPrice <= 0 {
+		return fmt.Errorf("input_price is required and must be positive (micro-USD per 1M tokens)")
+	}
+	if req.OutputPrice <= 0 {
+		return fmt.Errorf("output_price is required and must be positive (micro-USD per 1M tokens)")
 	}
 	return nil
 }
