@@ -38,6 +38,8 @@ struct Start: AsyncParsableCommand {
     var port: UInt16 = 8000
 
     mutating func run() async throws {
+        Darkbloom.ensureLogging()
+
         // GPU is required. Reject CPU fallback up-front so we never
         // come up reporting healthy and then silently churn at 0.5 tok/s.
         do {

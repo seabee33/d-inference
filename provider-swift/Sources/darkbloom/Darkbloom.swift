@@ -1,9 +1,18 @@
 import Foundation
 import ArgumentParser
+import Logging
 import ProviderCore
 
 @main
 struct Darkbloom: AsyncParsableCommand {
+
+    // Bootstrap swift-log to write to stderr so launchd captures output
+    // in provider.log. Without this, all Logger calls go to the no-op
+    // handler and produce zero output.
+    static let _bootstrapLogging: Void = {
+        LoggingSystem.bootstrap(StreamLogHandler.standardError)
+    }()
+
     static let configuration = CommandConfiguration(
         commandName: "darkbloom",
         abstract: "Swift-native provider CLI for Darkbloom.",
@@ -28,7 +37,13 @@ struct Darkbloom: AsyncParsableCommand {
     )
 
     mutating func run() async throws {
+        _ = Self._bootstrapLogging
         throw CleanExit.helpRequest(self)
+    }
+
+    /// Call at the start of every subcommand's run() to ensure logging is initialized.
+    static func ensureLogging() {
+        _ = _bootstrapLogging
     }
 }
 
@@ -76,6 +91,7 @@ struct RuntimeSnapshot {
 }
 
 func loadRuntimeSnapshot(configOptions: ConfigOptions) throws -> RuntimeSnapshot {
+    Darkbloom.ensureLogging()
     return try loadRuntimeSnapshot(configPath: configOptions.config)
 }
 
