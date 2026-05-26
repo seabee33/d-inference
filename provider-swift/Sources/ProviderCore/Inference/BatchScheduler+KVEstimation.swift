@@ -118,6 +118,18 @@ enum KVEstimation {
             layerTypes = Array(lt.prefix(l))
         }
 
+        // Context length: `max_position_embeddings` is canonical for modern
+        // transformers (Llama, Qwen, Gemma, Mistral). Fallbacks cover
+        // older model configs that use different field names.
+        var maxContextLength: Int? = cfg["max_position_embeddings"] as? Int
+            ?? cfg["max_sequence_length"] as? Int
+            ?? cfg["n_positions"] as? Int
+            ?? cfg["seq_length"] as? Int
+        // Clamp to a sane range (1 to 2M tokens).
+        if let mcl = maxContextLength {
+            maxContextLength = min(max(mcl, 1), 2_097_152)
+        }
+
         return ModelArchitecture(
             numLayers: numLayers,
             kvHeads: kvHeads,
@@ -126,7 +138,8 @@ enum KVEstimation {
             globalHeadDim: globalHeadDim,
             numGlobalKvHeads: numGlobalKvHeads,
             slidingWindowPattern: slidingWindowPattern,
-            layerTypes: layerTypes
+            layerTypes: layerTypes,
+            maxContextLength: maxContextLength
         )
     }
 
