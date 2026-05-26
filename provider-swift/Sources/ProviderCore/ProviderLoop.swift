@@ -218,6 +218,19 @@ public actor ProviderLoop {
     private static let schedulerPendingTimeout: Duration = .seconds(120)
     private static let schedulerDefaultMaxTokens = 4096
 
+    /// Infer the reasoning parser format from the model's `model_type`
+    /// (read from config.json at scan time). Used to auto-select the
+    /// parser when the consumer doesn't specify one.
+    static func inferReasoningParser(for modelType: String?) -> ReasoningParserFormat {
+        guard let type = modelType?.lowercased() else { return .qwen3 }
+        if type == "gpt_oss" { return .harmony }
+        if type.hasPrefix("gemma") { return .gemma4 }
+        if type.hasPrefix("qwen") { return .qwen3 }
+        if type.hasPrefix("deepseek") { return .deepseekR1 }
+        // Safe default: qwen3's <think> parser handles the most common format.
+        return .qwen3
+    }
+
     private struct ModelSlot {
         let scheduler: BatchScheduler
         let container: MLXLMCommon.ModelContainer
@@ -614,6 +627,7 @@ public actor ProviderLoop {
         let signingIdentity = self.signer
         let log = self.logger
         let tokenizer = slot.tokenizer
+        let modelType = loopConfig.models.first(where: { $0.id == modelId })?.modelType
 
         // 7. Spawn inference task. The streaming pipeline now flows through
         // the upstream `MLXLMServer` library:
@@ -668,7 +682,7 @@ public actor ProviderLoop {
             // still going through the upstream library for SSE encoding.
             let providerEngine = MultiModelBatchSchedulerEngine(
                 registryProvider: { @Sendable in
-                    [chatRequest.model: .init(scheduler: sched, tokenizer: tokenizer)]
+                    [chatRequest.model: .init(scheduler: sched, tokenizer: tokenizer, modelType: modelType)]
                 },
                 ensureLoaded: { _ in },
                 reserveModel: { _ in },
@@ -695,6 +709,15 @@ public actor ProviderLoop {
                 ?? OpenAIStreamOptions()
             forcedStreamOptions.includeUsage = true
             streamingRequest.streamOptions = forcedStreamOptions
+
+            // Auto-select reasoning parser based on model type if the
+            // consumer didn't specify one. This ensures model-specific
+            // reasoning tokens (Harmony channels, Gemma4 channels,
+            // Qwen3/DeepSeek <think> tags) are parsed into
+            // reasoning_content rather than leaking as raw content.
+            if streamingRequest.reasoningParser == nil {
+                streamingRequest.reasoningParser = Self.inferReasoningParser(for: modelType)
+            }
 
             let service = MLXOpenAIService(engine: providerEngine)
             let frames: AsyncThrowingStream<String, Error>
