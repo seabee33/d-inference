@@ -832,10 +832,11 @@ func TestNormalizeSSEChunk(t *testing.T) {
 				if !strings.Contains(got, `"tool_calls":[]`) {
 					t.Errorf("expected tool_calls to be empty array, got: %s", got)
 				}
-				// reasoning_content should be removed (merged into reasoning)
-				// to avoid ForgeCode serde duplicate-field errors.
-				if strings.Contains(got, `"reasoning_content"`) {
-					t.Errorf("expected reasoning_content to be removed (deduped into reasoning), got: %s", got)
+				// Both reasoning and reasoning_content should be present:
+				// reasoning_content for AI SDK compatibility, reasoning
+				// for ForgeCode and other clients.
+				if !strings.Contains(got, `"reasoning_content"`) {
+					t.Errorf("expected reasoning_content to be preserved for AI SDK, got: %s", got)
 				}
 			},
 		},

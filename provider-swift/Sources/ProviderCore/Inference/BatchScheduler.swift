@@ -259,6 +259,113 @@ public actor BatchScheduler {
 
     // MARK: - Submit / cancel
 
+    /// Submit a pre-tokenized prompt. Used by `MultiModelBatchSchedulerEngine`
+    /// which tokenizes the full OpenAI request (including tools, tool_call_id,
+    /// reasoning_content, etc.) itself, then hands the token IDs here.
+    ///
+    /// This bypasses the lossy `ChatMessage → applyChatTemplate` path in the
+    /// `ChatCompletionRequest` overload, which drops tool-related fields.
+    public func submitTokenized(
+        promptTokens: [Int],
+        maxTokens: Int,
+        temperature: Float = 0.0,
+        topP: Float? = nil,
+        topK: Int? = nil,
+        seed: UInt64? = nil,
+        requestId: String? = nil
+    ) async -> AsyncStream<GenerationEvent> {
+        let id = requestId ?? "req-\(UUID().uuidString.prefix(12))"
+        let (stream, continuation) = AsyncStream<GenerationEvent>.makeStream()
+
+        guard let engine = self.engine else {
+            continuation.yield(.error("No model loaded"))
+            continuation.finish()
+            return stream
+        }
+
+        let requestBudget = promptTokens.count + maxTokens
+        guard requestBudget <= tokenBudgetMax else {
+            continuation.yield(.error(
+                "token_budget_exhausted: request requires \(requestBudget) tokens but only \(tokenBudgetMax) available"
+            ))
+            continuation.finish()
+            return stream
+        }
+
+        let activeUsed = activeTokenBudgetUsed
+        if activeUsed + requestBudget > tokenBudgetMax {
+            continuation.yield(.error(
+                "token_budget_exhausted: request requires \(requestBudget) tokens but only \(tokenBudgetMax - activeUsed) available"
+            ))
+            continuation.finish()
+            return stream
+        }
+        let bridge = BridgeState(
+            requestId: id,
+            promptTokens: promptTokens.count,
+            maxTokens: maxTokens,
+            submittedAt: .now
+        )
+        activeBridges[id] = bridge
+
+        if let planner = self.planner {
+            await refreshPlannerPolicy(activeTokenBudget: tokenBudgetMax)
+            let result = await planner.admit(
+                id: id,
+                promptTokenCount: promptTokens.count,
+                maxOutputTokens: maxTokens
+            )
+            if case .rejected(_, let reason) = result {
+                await dropBridge(requestId: id)
+                continuation.yield(.error(Self.errorMessage(for: reason)))
+                continuation.finish()
+                return stream
+            }
+            await refreshPendingSummaryCache()
+        }
+
+        if let kvBudget {
+            let reserved = await kvBudget.reserve(
+                requestID: id,
+                kvBytesPerToken: kvBytesPerToken,
+                tokenCount: requestBudget
+            )
+            guard reserved else {
+                await dropBridge(requestId: id)
+                continuation.yield(.error("token_budget_exhausted: insufficient global KV cache headroom"))
+                continuation.finish()
+                return stream
+            }
+        }
+
+        var sp = SamplingParams(maxTokens: maxTokens, temperature: temperature)
+        if let topP { sp.topP = topP }
+        if let topK { sp.topK = topK }
+        if let seed { sp.seed = seed }
+
+        let req = Request(
+            requestId: id,
+            prompt: promptTokens as AnyHashable,
+            samplingParams: sp
+        )
+        _ = await engine.core.addRequest(req)
+
+        runBridge(
+            requestId: id,
+            outputStream: engine.core.streamOutputs(requestId: id),
+            continuation: continuation
+        )
+
+        let scheduler = self
+        continuation.onTermination = { @Sendable termination in
+            if case .cancelled = termination {
+                Task { await scheduler.cancel(requestId: id) }
+            }
+        }
+
+        return stream
+    }
+
     public func submit(
         request: ChatCompletionRequest,
         requestId: String? = nil

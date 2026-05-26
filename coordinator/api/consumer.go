@@ -2598,18 +2598,18 @@ func normalizeSSEChunk(chunk string) string {
 							delta["tool_calls"] = json.RawMessage(`[]`)
 							changed = true
 						}
-						// ForgeCode uses #[serde(alias = "reasoning_content")] on
-						// the "reasoning" field. If both keys are present, serde
-						// fails with a duplicate-field error. Keep only "reasoning".
+						// Emit BOTH "reasoning" and "reasoning_content" so both
+						// AI SDK (reads reasoning_content) and ForgeCode/other
+						// clients (reads reasoning) see reasoning tokens.
 						if _, hasR := delta["reasoning"]; hasR {
-							if _, hasRC := delta["reasoning_content"]; hasRC {
-								delete(delta, "reasoning_content")
+							if _, hasRC := delta["reasoning_content"]; !hasRC {
+								// Only reasoning exists — copy to reasoning_content for AI SDK.
+								delta["reasoning_content"] = delta["reasoning"]
 								changed = true
 							}
 						} else if rc, hasRC := delta["reasoning_content"]; hasRC {
-							// Only reasoning_content exists — rename to reasoning.
+							// Only reasoning_content exists — add reasoning alias.
 							delta["reasoning"] = rc
-							delete(delta, "reasoning_content")
 							changed = true
 						}
 						if changed {
