@@ -56,11 +56,6 @@ struct Start: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        guard !snapshot.models.isEmpty else {
-            printError("No local MLX models found. Download models to ~/.cache/huggingface/hub/")
-            throw ExitCode.failure
-        }
-
         if local {
             try await runLocalStandalone(
                 snapshot: snapshot,
@@ -75,7 +70,7 @@ struct Start: AsyncParsableCommand {
                 coordinatorURL: effectiveCoordinator
             )
         } else {
-            try launchDaemon(
+            try await launchDaemon(
                 snapshot: snapshot,
                 config: effectiveConfig,
                 coordinatorURL: effectiveCoordinator
@@ -303,11 +298,11 @@ struct Start: AsyncParsableCommand {
 
     // MARK: - Daemon (interactive picker → launchd)
 
-    private func launchDaemon(
+    private mutating func launchDaemon(
         snapshot: RuntimeSnapshot,
         config: ProviderConfig,
         coordinatorURL: String
-    ) throws {
+    ) async throws {
         let selectedModelIDs: [String]
 
         if !model.isEmpty {
@@ -315,7 +310,11 @@ struct Start: AsyncParsableCommand {
         } else if all {
             selectedModelIDs = snapshot.models.map(\.id)
         } else {
-            selectedModelIDs = try interactiveModelPicker(snapshot: snapshot, config: config)
+            selectedModelIDs = try await interactiveCatalogPicker(
+                snapshot: snapshot,
+                config: config,
+                coordinatorURL: coordinatorURL
+            )
         }
 
         guard !selectedModelIDs.isEmpty else {
@@ -341,21 +340,43 @@ struct Start: AsyncParsableCommand {
         print("  darkbloom status  Check status")
     }
 
-    // MARK: - Interactive Picker
+    // MARK: - Interactive Catalog Picker
 
-    private func interactiveModelPicker(
+    /// Fetches the model catalog from the coordinator, shows download status,
+    /// prompts the user to download missing models, then returns the selected
+    /// model IDs for serving.
+    private func interactiveCatalogPicker(
         snapshot: RuntimeSnapshot,
-        config: ProviderConfig
-    ) throws -> [String] {
-        let models = snapshot.models.sorted { $0.id < $1.id }
+        config: ProviderConfig,
+        coordinatorURL: String
+    ) async throws -> [String] {
+        let client = ModelCatalogClient(coordinatorURL: coordinatorURL)
+
+        let catalog: [CatalogModel]
+        do {
+            catalog = try await client.fetchCatalog(typeFilter: "text")
+        } catch {
+            printError("Could not fetch model catalog from coordinator: \(error)")
+            printError("hint: check your coordinator URL or use --model to specify models directly")
+            throw ExitCode.failure
+        }
+
+        guard !catalog.isEmpty else {
+            printError("No models in the coordinator catalog.")
+            throw ExitCode.failure
+        }
+
+        let localIDs = Set(snapshot.models.map(\.id))
 
         print()
-        print("  Available models:")
+        print("  Models (from coordinator catalog):")
         print()
-        for (i, m) in models.enumerated() {
-            let sizeStr = String(format: "%.1f GB", m.estimatedMemoryGb)
-            let quant = m.quantization ?? ""
-            print("    [\(i + 1)] \(m.id)  (\(sizeStr)\(quant.isEmpty ? "" : ", \(quant)"))")
+        for (i, entry) in catalog.enumerated() {
+            let downloaded = localIDs.contains(entry.id)
+            let status = downloaded ? "downloaded" : "not downloaded"
+            let sizeStr = String(format: "%.1f GB", entry.sizeGb)
+            let ramStr = entry.minRamGb.map { " (>= \($0) GB RAM)" } ?? ""
+            print("    [\(i + 1)] \(entry.displayName)  \(sizeStr)\(ramStr)  [\(status)]")
         }
         print()
         print("  Select models (comma-separated numbers, or 'all'): ", terminator: "")
@@ -364,23 +385,49 @@ struct Start: AsyncParsableCommand {
             return []
         }
 
+        let selectedEntries: [CatalogModel]
         if input.lowercased() == "all" {
-            return models.map(\.id)
-        }
-
-        let indices = input.split(separator: ",").compactMap { token -> Int? in
-            guard let n = Int(token.trimmingCharacters(in: .whitespaces)) else { return nil }
-            return n
-        }
-
-        var selected: [String] = []
-        for idx in indices {
-            guard idx >= 1, idx <= models.count else {
-                printError("Invalid selection: \(idx) (must be 1-\(models.count))")
-                throw ExitCode.failure
+            selectedEntries = catalog
+        } else {
+            let indices = input.split(separator: ",").compactMap { token -> Int? in
+                guard let n = Int(token.trimmingCharacters(in: .whitespaces)) else { return nil }
+                return n
             }
-            selected.append(models[idx - 1].id)
+            var entries: [CatalogModel] = []
+            for idx in indices {
+                guard idx >= 1, idx <= catalog.count else {
+                    printError("Invalid selection: \(idx) (must be 1-\(catalog.count))")
+                    throw ExitCode.failure
+                }
+                entries.append(catalog[idx - 1])
+            }
+            selectedEntries = entries
         }
-        return selected
+
+        // Download any missing models before starting.
+        let missing = selectedEntries.filter { !localIDs.contains($0.id) }
+        if !missing.isEmpty {
+            print()
+            print("  Downloading \(missing.count) model(s)...")
+            print()
+            let downloader = ModelDownloader(catalogClient: client)
+            for entry in missing {
+                print("  Downloading \(entry.displayName) (\(String(format: "%.1f GB", entry.sizeGb)))...")
+                do {
+                    try await downloader.download(model: entry) { progress in
+                        let mb = Double(progress.bytesDownloaded) / 1_048_576
+                        print("    \(progress.file)  \(String(format: "%.1f MB", mb))")
+                    }
+                    print("  \(entry.displayName) downloaded.")
+                } catch {
+                    printError("Failed to download \(entry.displayName): \(error)")
+                    printError("hint: download manually with `darkbloom models download \(entry.id)`")
+                    throw ExitCode.failure
+                }
+            }
+            print()
+        }
+
+        return selectedEntries.map(\.id)
     }
 }

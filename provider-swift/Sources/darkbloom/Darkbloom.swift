@@ -45,8 +45,11 @@ public func runUpdateBannerIfEnabled() async {
     if ProcessInfo.processInfo.environment["DARKBLOOM_NO_UPDATE_CHECK"] != nil {
         return
     }
+    // Do NOT construct ConfigOptions() directly -- its @Option property
+    // wrapper is uninitialized outside ArgumentParser's decoding lifecycle
+    // and accessing it causes a fatal error. Pass nil to use defaults.
     let coordinatorURL: String
-    if let snapshot = try? loadRuntimeSnapshot(configOptions: ConfigOptions()) {
+    if let snapshot = try? loadRuntimeSnapshot(configPath: nil) {
         coordinatorURL = snapshot.config.coordinator.url
     } else {
         coordinatorURL = "https://api.darkbloom.dev"
@@ -73,7 +76,11 @@ struct RuntimeSnapshot {
 }
 
 func loadRuntimeSnapshot(configOptions: ConfigOptions) throws -> RuntimeSnapshot {
-    let configPath = try resolveConfigPath(configOptions.config)
+    return try loadRuntimeSnapshot(configPath: configOptions.config)
+}
+
+func loadRuntimeSnapshot(configPath rawPath: String?) throws -> RuntimeSnapshot {
+    let configPath = try resolveConfigPath(rawPath)
     let configFileExists = FileManager.default.fileExists(atPath: configPath.path)
 
     let hardware: HardwareInfo?
