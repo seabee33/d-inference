@@ -904,6 +904,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		rawBody, _ = json.Marshal(parsed)
 	}
 
+	// Inject reasoning_parser from model registry runtime_parameters if the
+	// consumer hasn't specified one. This ensures models like GPT-OSS 20B
+	// (Harmony format) get their reasoning tokens parsed automatically.
+	if _, hasRP := parsed["reasoning_parser"]; !hasRP {
+		if rec, err := s.store.GetModelRegistryRecord(model); err == nil && rec.RuntimeParameters != nil {
+			if rp, ok := rec.RuntimeParameters["reasoning_parser"]; ok {
+				parsed["reasoning_parser"] = rp
+				rawBody, _ = json.Marshal(parsed)
+			}
+		}
+	}
+
 	stream, _ := parsed["stream"].(bool)
 	estimatedPromptTokens := estimatePromptTokens(parsed)
 	billingPromptTokens := estimateBillingPromptTokens(parsed)

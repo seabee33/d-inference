@@ -216,6 +216,55 @@ func (s *Server) handleAdminModelRegistryAction(w http.ResponseWriter, r *http.R
 		}
 		s.SyncModelCatalog()
 		writeJSON(w, http.StatusOK, map[string]any{"status": "updated", "model_id": modelID, "model_status": req.Status})
+	case "runtime-parameters":
+		var req struct {
+			RuntimeParameters map[string]any `json:"runtime_parameters"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "invalid JSON: "+err.Error()))
+			return
+		}
+		if req.RuntimeParameters == nil {
+			writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", "runtime_parameters is required"))
+			return
+		}
+		rec, err := s.store.GetModelRegistryRecord(modelID)
+		if err != nil {
+			s.writeModelRegistryStoreError(w, "get model for runtime_parameters update", err)
+			return
+		}
+		// Merge new parameters into existing ones (allows partial updates).
+		if rec.RuntimeParameters == nil {
+			rec.RuntimeParameters = make(map[string]any)
+		}
+		for k, v := range req.RuntimeParameters {
+			rec.RuntimeParameters[k] = v
+		}
+		entry := &store.ModelRegistryEntry{
+			ID:                rec.ID,
+			DisplayName:       rec.DisplayName,
+			Family:            rec.Family,
+			Architecture:      rec.Architecture,
+			Quantization:      rec.Quantization,
+			MaxContextLength:  rec.MaxContextLength,
+			MaxOutputLength:   rec.MaxOutputLength,
+			MinRAMGB:          rec.MinRAMGB,
+			Capabilities:      rec.Capabilities,
+			Status:            rec.Status,
+			Description:       rec.Description,
+			RuntimeParameters: rec.RuntimeParameters,
+			Metadata:          rec.Metadata,
+		}
+		if err := s.store.UpsertModelRegistryEntry(entry); err != nil {
+			s.writeModelRegistryStoreError(w, "update runtime_parameters", err)
+			return
+		}
+		s.SyncModelCatalog()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":             "updated",
+			"model_id":           modelID,
+			"runtime_parameters": rec.RuntimeParameters,
+		})
 	default:
 		writeJSON(w, http.StatusNotFound, errorResponse("not_found", "model action not found"))
 	}
