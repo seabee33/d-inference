@@ -1187,16 +1187,10 @@ public struct ModelDownloader: Sendable {
     }
 
     private static func sha256Hex(of url: URL) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-
-        var hasher = SHA256()
-        while true {
-            guard let chunk = try? handle.read(upToCount: 65536) else { return nil }
-            if chunk.isEmpty { break }
-            hasher.update(data: chunk)
-        }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        // Use WeightHasher.hashSingleFile which handles the NSFileProtection
+        // fallback for files moved from URLSession temp locations.
+        guard let digest = WeightHasher.hashSingleFile(at: url) else { return nil }
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     private static func ensureAvailableCapacity(at directory: URL, requiredBytes: Int64) throws {
