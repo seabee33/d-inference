@@ -241,6 +241,15 @@ jobs:
       # Build (tests run by CI, not the release workflow).
       # ----------------------------------------------------------------------
 
+      - name: Inject release version into ProviderCore
+        run: |
+          set -euo pipefail
+          CURRENT=$(grep -o '"[^"]*"' provider-swift/Sources/ProviderCore/ProviderCore.swift | tr -d '"')
+          echo "Replacing ProviderCore.version: $CURRENT → $VERSION"
+          sed -i '' "s|public static let version = \"$CURRENT\"|public static let version = \"$VERSION\"|" \
+            provider-swift/Sources/ProviderCore/ProviderCore.swift
+          grep 'public static let version' provider-swift/Sources/ProviderCore/ProviderCore.swift
+
       - name: Build provider-swift (release)
         working-directory: provider-swift
         run: |
