@@ -353,7 +353,7 @@ func parseAdminModelActionPath(p string) (string, string, bool) {
 	if rest == p || rest == "" {
 		return "", "", false
 	}
-	for _, action := range []string{"/promote", "/status"} {
+	for _, action := range []string{"/promote", "/status", "/runtime-parameters"} {
 		if strings.HasSuffix(rest, action) {
 			modelID, err := url.PathUnescape(strings.TrimSuffix(rest, action))
 			if err != nil {
