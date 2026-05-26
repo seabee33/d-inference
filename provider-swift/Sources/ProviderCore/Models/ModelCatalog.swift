@@ -123,7 +123,7 @@ private struct CatalogResponse: Codable {
 
 // MARK: - Errors
 
-public enum ModelCatalogError: Error, CustomStringConvertible, Sendable {
+public enum ModelCatalogError: Error, CustomStringConvertible, LocalizedError, Sendable {
     case unreachable(String)
     case http(Int, String)
     case decodeFailed(String)
@@ -139,6 +139,8 @@ public enum ModelCatalogError: Error, CustomStringConvertible, Sendable {
         case .downloadFailed(let d):        "download failed: \(d)"
         }
     }
+
+    public var errorDescription: String? { description }
 }
 
 // MARK: - Catalog client
@@ -258,7 +260,7 @@ public struct ModelDownloader: Sendable {
         r2CDNURL: String? = nil,
         urlSession: URLSession = .shared,
         catalogClient: ModelCatalogClient? = nil,
-        concurrency: Int = 8
+        concurrency: Int = 4
     ) {
         if let r2CDNURL { self.r2CDNURL = r2CDNURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) }
         else if let env = ProcessInfo.processInfo.environment["DARKBLOOM_R2_CDN_URL"], !env.isEmpty {
@@ -602,86 +604,66 @@ public struct ModelDownloader: Sendable {
             var existingBytes = fileSize(partial)
             var request = URLRequest(url: url)
             request.httpMethod = "GET"
-            request.timeoutInterval = 60
+            // Model shards are multi-GB files. A 60-second request timeout
+            // causes legitimate downloads to fail; let URLSession stream to a
+            // temporary file with a longer timeout instead of iterating
+            // one byte at a time in Swift.
+            request.timeoutInterval = 6 * 60 * 60
             if existingBytes > 0 {
                 request.setValue("bytes=\(existingBytes)-", forHTTPHeaderField: "Range")
             }
 
             do {
-                let (bytes, response) = try await urlSession.bytes(for: request)
+                let (tempFile, response) = try await urlSession.download(for: request)
+
+                // URLSession.download(for:) returns a temp file that the system
+                // may reclaim after this call returns. Move it to a stable
+                // location immediately before doing anything else.
+                try? fm.removeItem(at: partial)
+                try fm.moveItem(at: tempFile, to: partial)
+
                 guard let http = response as? HTTPURLResponse else {
+                    try? fm.removeItem(at: partial)
                     throw ModelCatalogError.downloadFailed("\(label): unexpected response type")
                 }
 
                 if http.statusCode == 404 || http.statusCode == 403 {
+                    try? fm.removeItem(at: partial)
                     if required {
                         throw ModelCatalogError.downloadFailed("\(label): HTTP \(http.statusCode)")
                     }
                     return false
                 }
-                if http.statusCode == 416, existingBytes > 0 {
-                    // Stale .part is already complete or inconsistent with the
-                    // current object. Delete it and retry once from byte 0.
-                    try? fm.removeItem(at: partial)
-                    existingBytes = 0
-                    throw ModelCatalogError.downloadFailed("\(label): stale partial download")
-                }
                 guard (200..<300).contains(http.statusCode) else {
+                    try? fm.removeItem(at: partial)
                     throw ModelCatalogError.downloadFailed("\(label): HTTP \(http.statusCode)")
                 }
 
-                let appending = existingBytes > 0 && http.statusCode == 206
-                if existingBytes > 0 && !appending {
-                    try? fm.removeItem(at: partial)
-                    existingBytes = 0
-                }
-                if !fm.fileExists(atPath: partial.path) {
-                    fm.createFile(atPath: partial.path, contents: nil)
-                }
-
-                guard let handle = try? FileHandle(forWritingTo: partial) else {
-                    throw ModelCatalogError.downloadFailed("\(label): could not open destination")
-                }
-                defer { try? handle.close() }
-                if appending {
-                    try handle.seekToEnd()
-                } else {
-                    try handle.truncate(atOffset: 0)
-                }
-
-                let expectedLength = http.expectedContentLength >= 0 ? http.expectedContentLength : -1
-                let total = expectedLength >= 0 ? existingBytes + expectedLength : nil
-                var downloaded = existingBytes
-                var buffer = Data()
-                buffer.reserveCapacity(1_048_576)
-                var nextProgress = downloaded + 64 * 1_048_576
-
-                for try await byte in bytes {
-                    buffer.append(byte)
-                    if buffer.count >= 1_048_576 {
-                        try handle.write(contentsOf: buffer)
-                        downloaded += Int64(buffer.count)
-                        buffer.removeAll(keepingCapacity: true)
-                        if downloaded >= nextProgress {
-                            onProgress?(ProgressEvent(file: label, bytesDownloaded: downloaded, bytesTotal: total))
-                            nextProgress = downloaded + 64 * 1_048_576
-                        }
-                    }
-                }
-                if !buffer.isEmpty {
-                    try handle.write(contentsOf: buffer)
-                    downloaded += Int64(buffer.count)
-                }
-                try handle.close()
                 if let expectedSHA256 {
-                    guard let actual = Self.sha256Hex(of: partial), actual == expectedSHA256 else {
+                    // Compute SHA-256 using Data(contentsOf:) as a fallback
+                    // if FileHandle-based streaming fails (sandbox/permissions).
+                    let actual: String
+                    if let hash = Self.sha256Hex(of: partial) {
+                        actual = hash
+                    } else if let data = try? Data(contentsOf: partial) {
+                        var hasher = SHA256()
+                        hasher.update(data: data)
+                        actual = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+                    } else {
+                        actual = "<unreadable>"
+                    }
+                    let size = fileSize(partial)
+                    guard actual == expectedSHA256 else {
                         try? fm.removeItem(at: partial)
-                        throw ModelCatalogError.downloadFailed("\(label): SHA-256 mismatch")
+                        throw ModelCatalogError.downloadFailed(
+                            "\(label): SHA-256 mismatch (size=\(size), expected=\(expectedSHA256.prefix(16))…, got=\(actual.prefix(16))…)"
+                        )
                     }
                 }
                 try? fm.removeItem(at: destination)
                 try fm.moveItem(at: partial, to: destination)
-                onProgress?(ProgressEvent(file: label, bytesDownloaded: downloaded, bytesTotal: total ?? downloaded))
+                let downloaded = fileSize(destination)
+                onProgress?(ProgressEvent(file: label, bytesDownloaded: downloaded, bytesTotal: downloaded))
                 return true
             } catch {
                 lastError = error
@@ -693,9 +675,36 @@ public struct ModelDownloader: Sendable {
         }
 
         if required {
-            throw ModelCatalogError.downloadFailed("\(label): \(lastError?.localizedDescription ?? "unknown error")")
+            throw ModelCatalogError.downloadFailed(Self.downloadFailureMessage(label: label, error: lastError))
         }
         return false
+    }
+
+    private static func appendFile(_ source: URL, to destination: URL) throws {
+        guard let reader = try? FileHandle(forReadingFrom: source) else {
+            throw ModelCatalogError.downloadFailed("could not open downloaded file")
+        }
+        defer { try? reader.close() }
+
+        guard let writer = try? FileHandle(forWritingTo: destination) else {
+            throw ModelCatalogError.downloadFailed("could not open partial destination")
+        }
+        defer { try? writer.close() }
+
+        try writer.seekToEnd()
+        while true {
+            guard let chunk = try reader.read(upToCount: 4 * 1_048_576) else { break }
+            if chunk.isEmpty { break }
+            try writer.write(contentsOf: chunk)
+        }
+    }
+
+    private static func downloadFailureMessage(label: String, error: Error?) -> String {
+        guard let error else { return "\(label): unknown error" }
+        if case .downloadFailed(let detail) = error as? ModelCatalogError {
+            return detail.hasPrefix("\(label):") ? detail : "\(label): \(detail)"
+        }
+        return "\(label): \(error.localizedDescription)"
     }
 
     private func writeMainRef(for modelID: String) throws {
