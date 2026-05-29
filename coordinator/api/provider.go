@@ -484,10 +484,10 @@ func (s *Server) challengeLoop(ctx context.Context, conn *websocket.Conn, provid
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			provider.Mu().Lock()
-			untrusted := provider.Status == registry.StatusUntrusted
-			provider.Mu().Unlock()
-			if untrusted {
+			// Stop only for a hard (non-recoverable) untrust. A transiently
+			// untrusted provider (missed-challenge timeouts) keeps being
+			// challenged so a later passing challenge can restore it.
+			if provider.ChallengeShouldStop() {
 				return
 			}
 			s.sendChallenge(ctx, conn, providerID, provider, tracker)
@@ -912,7 +912,17 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 	provider.Mu().Unlock()
 
 	// Challenge passed.
-	s.registry.RecordChallengeSuccess(providerID)
+	recovered := s.registry.RecordChallengeSuccess(providerID)
+	if recovered {
+		// The provider was transiently untrusted and is now back online. It was
+		// last told "untrusted" (handleChallengeFailure) and scheduled a 10-min
+		// diagnostic auto-report; push a fresh "online" trust_status so it clears
+		// that local state and cancels the report.
+		provider.Mu().Lock()
+		trustLevel := provider.TrustLevel
+		provider.Mu().Unlock()
+		s.sendTrustStatus(provider, trustLevel, "online", "recovered after transient deroute")
+	}
 	s.ddIncr("attestation.challenges", []string{"outcome:passed"})
 	s.logger.Info("attestation challenge verified",
 		"provider_id", providerID,
@@ -964,7 +974,14 @@ func (s *Server) handleChallengeFailure(providerID string, reason string) {
 	severity := protocol.SeverityWarn
 	if failures >= registry.MaxFailedChallenges {
 		severity = protocol.SeverityError
-		s.registry.MarkUntrusted(providerID)
+		if transient {
+			// Missed-challenge timeouts (sleep / network blip) are recoverable:
+			// keep challenging and let a later passing challenge restore the
+			// provider without requiring a reconnect.
+			s.registry.MarkUntrustedTransient(providerID)
+		} else {
+			s.registry.MarkUntrusted(providerID)
+		}
 		if p := s.registry.GetProvider(providerID); p != nil {
 			s.sendTrustStatus(p, p.TrustLevel, string(registry.StatusUntrusted), reason)
 		}
