@@ -191,6 +191,7 @@ func (s *Server) dispatchOneProvider(
 		BaseReservedMicroUSD:   reservedMicroUSD,
 		AllowedProviderSerials: allowedProviderSerials,
 		SelfRouteOnly:          policy.enabled,
+		PreferOwner:            policy.prefer,
 		OwnerAccountID:         policy.ownerAccountID,
 		FreeSelfRoute:          policy.enabled,
 		AcceptedCh:             make(chan struct{}, 1),
@@ -230,14 +231,27 @@ func (s *Server) dispatchOneProvider(
 		pr.Timing.RoutedAt = time.Now()
 	}
 
-	if s.billing != nil && !policy.enabled && !providerHasPayoutDestination(provider) {
+	// A request settles FREE when it's served by a machine the caller owns:
+	// exclusive self-route (policy.enabled) always, OR a prefer request whose
+	// SELECTED provider is the caller's own machine (settlement refunds it to
+	// zero). In that case there is no payout and no reservation to top up — and
+	// applying a provider custom price above the platform rate would wrongly 429
+	// the free owned route, so skip both the payout warning and the top-up.
+	settlesFree := policy.enabled
+	if !settlesFree && policy.prefer {
+		provider.Mu().Lock()
+		settlesFree = policy.ownerAccountID != "" && provider.AccountID == policy.ownerAccountID
+		provider.Mu().Unlock()
+	}
+
+	if s.billing != nil && !settlesFree && !providerHasPayoutDestination(provider) {
 		s.logger.Warn("provider missing payout destination, crediting to internal ledger",
 			"provider_id", provider.ID)
 	}
 
-	// Free self-route requests are settled at zero cost (handleComplete), so
-	// there is no reservation to top up for a provider's custom price.
-	if s.billing != nil && !policy.enabled {
+	// Free (owned) requests are settled at zero cost (handleComplete), so there
+	// is no reservation to top up for a provider's custom price.
+	if s.billing != nil && !settlesFree {
 		_, err := s.reserveAdditionalForProvider(pr, provider)
 		if err != nil {
 			cleanupPending()
@@ -1114,6 +1128,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			refundReservation()
 			return
 		}
+	} else if policy.prefer {
+		// Prefer mode: SKIP the public fleet pre-flight. QuickCapacityCheck has
+		// no owner-trust relaxation, so it would spuriously 429/503 a request
+		// whose own (idle, possibly un-enrolled / private-only) machine could
+		// serve it while the public fleet is busy. Dispatch does owned-first
+		// routing with a paid public fallback and the normal queue, which is the
+		// correct gate for prefer.
 	} else {
 		// Pre-flight capacity check: can ANY provider serve this model right
 		// now? If not, return 429 immediately rather than queueing for up to
@@ -1235,6 +1256,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				BaseReservedMicroUSD:   reservedMicroUSD,
 				AllowedProviderSerials: allowedProviderSerials,
 				SelfRouteOnly:          policy.enabled,
+				PreferOwner:            policy.prefer,
 				OwnerAccountID:         policy.ownerAccountID,
 				FreeSelfRoute:          policy.enabled,
 				AcceptedCh:             make(chan struct{}, 1),
@@ -1302,7 +1324,19 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			// Log missing payout destination but don't skip — earnings
 			// are credited to the provider's internal ledger and can be
 			// withdrawn once they complete Stripe Connect onboarding.
-			if s.billing != nil && !policy.enabled && !providerHasPayoutDestination(provider) {
+			// A queued request settles FREE when its drained provider is the
+			// caller's own machine: exclusive self-route always, OR a prefer
+			// request whose selected provider is owned (settlement refunds to
+			// zero). Skip the payout warning and the custom-price top-up then
+			// (the top-up could otherwise 429 the free owned route).
+			queuedSettlesFree := policy.enabled
+			if !queuedSettlesFree && policy.prefer {
+				provider.Mu().Lock()
+				queuedSettlesFree = policy.ownerAccountID != "" && provider.AccountID == policy.ownerAccountID
+				provider.Mu().Unlock()
+			}
+
+			if s.billing != nil && !queuedSettlesFree && !providerHasPayoutDestination(provider) {
 				s.logger.Warn("queued provider missing payout destination, crediting to internal ledger",
 					"request_id", requestID,
 					"provider_id", provider.ID,
@@ -1312,7 +1346,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			// Custom pricing check — provider may charge more than the
 			// platform rate. Reserve the additional amount now. Skipped for
 			// free self-route, which settles at zero cost.
-			if s.billing != nil && !policy.enabled {
+			if s.billing != nil && !queuedSettlesFree {
 				if _, err := s.reserveAdditionalForProvider(pr, provider); err != nil {
 					provider.RemovePending(requestID)
 					s.registry.SetProviderIdle(provider.ID)
@@ -1491,18 +1525,38 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			// Primary is slow. Attempt speculative backup dispatch.
 			s.ddIncr("inference.speculative_dispatch", []string{"model:" + model})
 
-			backupExclude := make(map[string]struct{}, len(excludeProviders)+1)
-			for id := range excludeProviders {
-				backupExclude[id] = struct{}{}
-			}
-			backupExclude[provider.ID] = struct{}{}
+			var backupProvider *registry.Provider
+			var backupPR *registry.PendingRequest
 
-			backupProvider, backupPR, _, _, _ := s.dispatchOneProvider(
-				r, model, rawBody, consumerKey, consumerLocation, reservedMicroUSD,
-				estimatedPromptTokens, requestedMaxTokens, allowedProviderSerials,
-				isResponsesAPI, policy, &registry.RequestTiming{ReceivedAt: timing.ReceivedAt},
-				backupExclude,
-			)
+			// Do NOT speculatively race a paid PUBLIC backup against a prefer
+			// request that is being served by the caller's OWN machine: the user
+			// opted into "prefer my machine (free)", so a slow owned machine must
+			// be waited on, not raced (and billed) by the public fleet. (Exclusive
+			// self-route is already safe — its backup selection is owned-only and
+			// returns nil when there's no other owned machine.) When the prefer
+			// primary is itself a public provider (the owner owns nothing / fell
+			// back), normal speculative behaviour applies.
+			skipBackup := false
+			if policy.prefer {
+				provider.Mu().Lock()
+				skipBackup = policy.ownerAccountID != "" && provider.AccountID == policy.ownerAccountID
+				provider.Mu().Unlock()
+			}
+
+			if !skipBackup {
+				backupExclude := make(map[string]struct{}, len(excludeProviders)+1)
+				for id := range excludeProviders {
+					backupExclude[id] = struct{}{}
+				}
+				backupExclude[provider.ID] = struct{}{}
+
+				backupProvider, backupPR, _, _, _ = s.dispatchOneProvider(
+					r, model, rawBody, consumerKey, consumerLocation, reservedMicroUSD,
+					estimatedPromptTokens, requestedMaxTokens, allowedProviderSerials,
+					isResponsesAPI, policy, &registry.RequestTiming{ReceivedAt: timing.ReceivedAt},
+					backupExclude,
+				)
+			}
 
 			if backupProvider == nil {
 				// No backup available. Keep waiting for primary with remaining deadline.
@@ -4043,6 +4097,9 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			refundReservation()
 			return
 		}
+	} else if policy.prefer {
+		// Prefer mode skips the public fleet pre-flight (no owner-trust
+		// relaxation there); owned-first dispatch + paid fallback + queue gate it.
 	} else {
 		candidateCount, capacityRejections, modelTooLarge := s.registry.QuickCapacityCheck(model, estimatedPromptTokens, requestedMaxTokens, allowedProviderSerials...)
 		if candidateCount == 0 && capacityRejections == 0 && modelTooLarge > 0 {
@@ -4076,6 +4133,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		ConsumerLocation:       consumerLocation,
 		AllowedProviderSerials: allowedProviderSerials,
 		SelfRouteOnly:          policy.enabled,
+		PreferOwner:            policy.prefer,
 		OwnerAccountID:         policy.ownerAccountID,
 		FreeSelfRoute:          policy.enabled,
 		EstimatedPromptTokens:  estimatedPromptTokens,
@@ -4113,14 +4171,25 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			break
 		}
 
-		if s.billing != nil && !policy.enabled && !providerHasPayoutDestination(provider) {
+		// Settles FREE when served by the caller's own machine: exclusive
+		// self-route always, or a prefer request whose selected provider is owned
+		// (settlement refunds to zero). Skip the payout warning + custom-price
+		// top-up then (the top-up could otherwise 429 the free owned route).
+		settlesFree := policy.enabled
+		if !settlesFree && policy.prefer {
+			provider.Mu().Lock()
+			settlesFree = policy.ownerAccountID != "" && provider.AccountID == policy.ownerAccountID
+			provider.Mu().Unlock()
+		}
+
+		if s.billing != nil && !settlesFree && !providerHasPayoutDestination(provider) {
 			s.logger.Warn("provider missing payout destination, crediting to internal ledger",
 				"provider_id", provider.ID)
 		}
 
 		// Custom pricing check — provider may charge more than the platform
-		// rate. Skipped for free self-route, which settles at zero cost.
-		if s.billing != nil && !policy.enabled {
+		// rate. Skipped for free (owned) requests, which settle at zero cost.
+		if s.billing != nil && !settlesFree {
 			if _, err := s.reserveAdditionalForProvider(pr, provider); err != nil {
 				provider.RemovePending(requestID)
 				s.registry.SetProviderIdle(provider.ID)
@@ -4209,12 +4278,21 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 	defer cleanupPending()
-	if s.billing != nil && !policy.enabled && !providerHasPayoutDestination(provider) {
+	// Settles FREE when served by the caller's own machine (exclusive self-route,
+	// or a prefer request whose selected provider is owned — settlement refunds
+	// to zero). Skip the payout warning + custom-price top-up then.
+	settlesFreeDirect := policy.enabled
+	if !settlesFreeDirect && policy.prefer {
+		provider.Mu().Lock()
+		settlesFreeDirect = policy.ownerAccountID != "" && provider.AccountID == policy.ownerAccountID
+		provider.Mu().Unlock()
+	}
+	if s.billing != nil && !settlesFreeDirect && !providerHasPayoutDestination(provider) {
 		s.logger.Warn("provider missing payout destination, crediting to internal ledger",
 			"provider_id", provider.ID)
 	}
-	// Free self-route settles at zero cost — no provider-price top-up.
-	if s.billing != nil && !policy.enabled {
+	// Free (owned) requests settle at zero cost — no provider-price top-up.
+	if s.billing != nil && !settlesFreeDirect {
 		if _, err := s.reserveAdditionalForProvider(pr, provider); err != nil {
 			cleanupPending()
 			refundExtra()

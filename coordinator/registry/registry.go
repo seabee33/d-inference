@@ -97,9 +97,19 @@ type PendingRequest struct {
 	// public fleet. The owner-match is on the coordinator-stamped AccountID,
 	// never on any client-supplied value.
 	SelfRouteOnly bool
+	// PreferOwner is the "prefer my own machine, but fall back to the paid
+	// fleet" mode. Unlike SelfRouteOnly it does NOT exclude public providers:
+	// the scheduler picks the caller's own machine whenever one can serve, and
+	// only falls back to the public fleet (charged normally) when none can. The
+	// hardware-trust floor is relaxed for the caller's own (possibly un-enrolled)
+	// machine, exactly as for SelfRouteOnly, but never for public providers.
+	// Billing is decided at settlement: free if an owned machine actually served
+	// it, paid otherwise — so a PreferOwner request takes a normal reservation
+	// up front (unlike SelfRouteOnly, which skips it).
+	PreferOwner bool
 	// OwnerAccountID is the authenticated account that must own the serving
-	// provider when SelfRouteOnly is set. Stamped server-side from the
-	// request's authenticated identity.
+	// provider when SelfRouteOnly or PreferOwner is set. Stamped server-side
+	// from the request's authenticated identity.
 	OwnerAccountID string
 	// FreeSelfRoute marks a request that must settle at zero cost (no charge,
 	// no platform fee, no provider payout) because it is served by a machine
@@ -1430,6 +1440,14 @@ func (r *Registry) providerHasWarmModelLocked(p *Provider, model string, now tim
 	if p.Status == StatusOffline || p.Status == StatusUntrusted {
 		return false
 	}
+	// Private-only providers serve only their owner's self-route traffic, never
+	// the public fleet. They must not suppress public swap planning: otherwise a
+	// private-only machine that happens to hold a queued public model warm makes
+	// the planner believe the model is already served and skip load_model to an
+	// eligible public node, stranding public requests until queue timeout.
+	if p.PrivateOnly {
+		return false
+	}
 	if trustRank(p.TrustLevel) < trustRank(r.MinTrustLevel) {
 		return false
 	}
@@ -1503,6 +1521,11 @@ func (r *Registry) modelLoadCandidatePendingLocked(p *Provider, model string, no
 	defer p.mu.Unlock()
 
 	if p.Status == StatusOffline || p.Status == StatusUntrusted {
+		return 0, false
+	}
+	// Private-only providers never serve public traffic, so never pick one as a
+	// public load_model target (mirrors the public-routing exclusion).
+	if p.PrivateOnly {
 		return 0, false
 	}
 	if trustRank(p.TrustLevel) < trustRank(r.MinTrustLevel) {
@@ -1672,7 +1695,18 @@ func (r *Registry) RejectUnservableQueuedRequests(modelID string) {
 		return
 	}
 
-	failed := r.queue.FailQueuedRequestsForModel(modelID)
+	// Prefer waiters are preserved only when their owner actually has an owned
+	// provider serving this model (it may free up). A prefer waiter with no
+	// owned provider is just waiting on the (now-unservable) public fleet, so it
+	// should fail fast like any public request. Compute eligibility here —
+	// OUTSIDE the queue lock — since OwnedProviderSummary takes the registry lock.
+	preferOwnerEligible := make(map[string]bool)
+	for _, owner := range r.queue.PreferWaiterOwners(modelID) {
+		_, servesModel := r.OwnedProviderSummary(owner, modelID)
+		preferOwnerEligible[owner] = servesModel > 0
+	}
+
+	failed := r.queue.FailQueuedRequestsForModel(modelID, preferOwnerEligible)
 	if failed > 0 {
 		r.logger.Warn("rejected queued requests for unservable model",
 			"model_id", modelID,
@@ -2295,9 +2329,15 @@ func (r *Registry) ListModels() []AggregateModel {
 		attested := p.Attested
 		attestResult := p.AttestationResult
 		privateReady := providerSupportsPrivateTextLocked(p)
+		privateOnly := p.PrivateOnly
 		p.mu.Unlock()
 
 		if status == StatusOffline || status == StatusUntrusted {
+			continue
+		}
+		// Private-only providers serve only their owner's self-route traffic, so
+		// they must not appear in or inflate the public /v1/models aggregation.
+		if privateOnly {
 			continue
 		}
 		if !r.trustMeetsMinimum(trust) || !privateReady {

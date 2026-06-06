@@ -479,10 +479,13 @@ export async function streamChat(
   // outgoing body to the coordinator's published X25519 pubkey, then decrypt
   // each SSE event on the way back.
   const requestBody = { model, messages, stream: true };
-  // "Use my machine, for free": opt-in routing to the caller's own provider.
+  // "Use my machine": the chat composer toggle prioritizes the caller's own
+  // provider (free when it serves) but falls back to the paid fleet when their
+  // machine can't — so the toggle is never a dead end. That's the `prefer`
+  // intent; the strict free-only ceiling lives on the API key (self_route_only).
   // Carried as a header so it never enters the (optionally sealed) body.
   const selfRouteHeader: Record<string, string> = opts?.selfRoute
-    ? { "X-Darkbloom-Route": "self" }
+    ? { "X-Darkbloom-Route": "prefer" }
     : {};
   let sealCtx: { ephemPriv: Uint8Array; coordPub: Uint8Array } | null = null;
   let fetchHeaders = proxyHeaders(selfRouteHeader);
@@ -559,14 +562,15 @@ export async function streamChat(
     try {
       const errData = JSON.parse(text);
       const msg = errData?.error?.message || text;
-      // Self-route ("My Machine") specific errors map to actionable copy. The
-      // coordinator never falls back to paid providers for these, so the
-      // messaging is explicit rather than a generic retry.
+      // Strict free-only self-route errors (from a `self_route_only` API key)
+      // map to actionable copy. These only occur on the exclusive free-only
+      // path, which never falls back to paid providers — the "My Machine" chat
+      // toggle uses `prefer` and falls back, so it won't produce these codes.
       const code = errData?.error?.code as string | undefined;
       if (code === "no_linked_machine") {
         callbacks.onError("No machine linked to your account — run `darkbloom login` on your Mac, then try again.");
       } else if (code === "machine_offline") {
-        callbacks.onError("Your machine is offline — start your Darkbloom node and try again. (My Machine never falls back to paid providers.)");
+        callbacks.onError("Your machine is offline — start your Darkbloom node and try again. (Free-only self-route won't fall back to the paid network.)");
       } else if (code === "model_not_loaded") {
         callbacks.onError("This model isn't loaded on your machine — load it on your node, then try again.");
       } else if (code === "machine_busy") {
