@@ -15,7 +15,7 @@
 //     stay `fileprivate` in spirit but compile as `internal` because
 //     the bridge Task lives in this extension file (and the symbols
 //     are also called from `cancel` paths in the main file).
-//   * `recordProgress` is new (P2 fix: in-flight decode visibility).
+//   * `recordProgress` is new (in-flight decode visibility).
 
 import Foundation
 import MLXLMCommon
@@ -59,7 +59,7 @@ extension BatchScheduler {
                     sawFirstToken = true
                 }
 
-                // P2: keep `BridgeState.completionTokens` live so
+                // keep `BridgeState.completionTokens` live so
                 // `backendCapacity()` (heartbeats) reports in-flight
                 // decode progress, not stale zeros until finish.
                 if output.completionTokens > 0 || output.promptTokens > 0 {
@@ -156,7 +156,7 @@ extension BatchScheduler {
         activeBridges[requestId] = bridge
     }
 
-    /// P2 fix: refresh the bridge's prompt + completion token counts on
+    /// Refresh the bridge's prompt + completion token counts on
     /// every non-empty `RequestOutput` so `backendCapacity()` reports
     /// live in-flight decode (vs. stale 0 until `recordFinish`).
     ///
@@ -214,7 +214,7 @@ extension BatchScheduler {
         }
 
         if success, tps > 0 {
-            // P2 fix: previously `activeBridges.count + 1` mixed in
+            // Previously `activeBridges.count + 1` mixed in
             // queued-not-admitted bridges. Use admitted-and-running
             // count (admittedAt != nil) + 1 for the just-finished one.
             let runningRows = activeBridges.values.filter { $0.admittedAt != nil }.count + 1
@@ -274,6 +274,48 @@ extension BatchScheduler {
         }
     }
 
+    // MARK: - Prefix-cache stats logger
+
+    /// Spawn the periodic checkpoint-tier hit/miss logger. Called from
+    /// `loadModel` after the checkpoint manager is installed; cancelled (and
+    /// re-spawned) on every `stopCurrentEngine` / `loadModel` cycle. No-op when
+    /// the interval is 0 (disabled) or there is no checkpoint manager (engine
+    /// tier / cache off). Snapshots are cheap (a struct copy across the manager
+    /// actor), so a 2-minute cadence is free.
+    func startPrefixCacheStatsLogger() {
+        prefixCacheStatsTask?.cancel()
+        prefixCacheStatsTask = nil
+        let interval = Self.prefixCacheStatsIntervalSecs()
+        guard interval > 0, checkpointManager != nil else { return }
+        let scheduler = self
+        prefixCacheStatsTask = Task.detached {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(interval))
+                if Task.isCancelled { return }
+                await scheduler.logPrefixCacheStats()
+            }
+        }
+    }
+
+    /// Read the checkpoint manager's cumulative counters and emit one info
+    /// line. Hit rate = (ramHits + ssdHits) / (ramHits + ssdHits + misses).
+    /// `misses` here counts only lookups that found neither RAM nor SSD entry
+    /// — i.e. genuine cold/unique prompts — so the rate reflects reuse of
+    /// cacheable prefixes, not the unique-prompt floor the workload injects.
+    func logPrefixCacheStats() async {
+        guard let mgr = checkpointManager else { return }
+        let s = await mgr.snapshotStats()
+        let lookups = s.ramHits + s.ssdHits + s.misses
+        let hits = s.ramHits + s.ssdHits
+        let rate = lookups > 0 ? (Double(hits) * 100.0 / Double(lookups)) : 0.0
+        // os.Logger redacts non-literal interpolations (String(format:)) as
+        // <private> by default; mark the rate .public so the hit rate is
+        // actually readable. Integer interpolations default to public already.
+        let rateStr = String(format: "%.1f", rate)
+        prefixCacheLogger.info(
+            "prefix cache stats: lookups=\(lookups) hits=\(hits) (ram=\(s.ramHits) ssd=\(s.ssdHits)) misses=\(s.misses) hitRate=\(rateStr, privacy: .public)% stores=\(s.stores) ssdFlushes=\(s.ssdFlushes) diskEvictions=\(s.diskEvictions) ssdReadErrors=\(s.ssdReadErrors) modelMismatch=\(s.modelMismatches) shapeMismatch=\(s.shapeMismatches) prefixHashMismatch=\(s.prefixHashMismatches)")
+    }
+
     /// Watchdog body: abort bridges still waiting for engine admission
     /// past `pendingTimeout`. A long prefill is admitted but emits no
     /// decoded token yet; admittedAt != nil filters those out so they
@@ -285,11 +327,26 @@ extension BatchScheduler {
             bridge.admittedAt == nil
                 && now - bridge.submittedAt >= pendingTimeout
         }
+        var abortedLocally: [String] = []
         for (id, _) in timedOut {
             // Insert BEFORE abort so the streaming Task sees the flag
             // when it consumes the resulting terminal RequestOutput.
             timedOutBridges.insert(id)
-            _ = engine.core.abortRequest(id)
+            // AbortRequest returns false when the engine has no
+            // collector for this id yet — the request is still mid-submit (its
+            // `addRequest` engineQueue block hasn't run, so `runBridge`/the
+            // output stream don't exist yet either). The engine abort is then a
+            // no-op AND no terminal output will ever arrive, so the bridge would
+            // sit in `activeBridges` past its timeout leaking KV/planner budget.
+            // Drop it locally. Safe: a false return guarantees no engine
+            // collector, hence no streaming Task consuming for this id; if its
+            // add later lands, the bridge is gone and its outputs are no-ops.
+            if !engine.core.abortRequest(id) {
+                abortedLocally.append(id)
+            }
+        }
+        for id in abortedLocally {
+            await dropBridge(requestId: id)  // also clears the timedOutBridges flag
         }
         await refreshPendingSummaryCache()
     }
@@ -318,5 +375,14 @@ extension BatchScheduler {
         )
         if admitted { bridge.admittedAt = .now }
         activeBridges[id] = bridge
+    }
+
+    /// Test accessor: is a bridge still tracked for `id`? This is the exact
+    /// signal `confirmEnqueuedOrAbort` checks after `addRequest` to detect a
+    /// request that was cancelled / timed-out while the submit task was
+    /// suspended (the cancel/timeout path `dropBridge`'d it) and must therefore
+    /// be aborted rather than handed to `runBridge`.
+    func _bridgeIsActiveForTest(_ id: String) -> Bool {
+        activeBridges[id] != nil
     }
 }

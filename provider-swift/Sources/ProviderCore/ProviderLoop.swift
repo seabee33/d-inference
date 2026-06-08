@@ -109,6 +109,8 @@ public actor ProviderLoop {
     private let state: ProviderState
     private let cancellationRegistry: InferenceCancellationRegistry
     private let kvBudget: GlobalKVCacheBudget
+    /// Phase 3: global disk accountant (process-wide, shared across models).
+    private let diskAccountant: GlobalDiskAccountant
     private let powerAssertion: InferencePowerAssertion
     private let preloadTaskStarted: (@Sendable (String) -> Void)?
     private let beforeModelLoad: (@Sendable (String) async -> Void)?
@@ -242,6 +244,13 @@ public actor ProviderLoop {
         self.maxModelSlots = max(1, min(config.models.count, Int(config.config.backend.maxModelSlots)))
         let reserveBytes = Self.memoryReserveBytes(forGiB: config.config.provider.memoryReserveGB)
         self.kvBudget = GlobalKVCacheBudget(reserveBytes: reserveBytes)
+        // Phase 3: construct the global disk accountant (one per host).
+        let kvRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("darkbloom/kv", isDirectory: true)
+            ?? FileManager.default.temporaryDirectory.appendingPathComponent("darkbloom/kv")
+        self.diskAccountant = GlobalDiskAccountant(
+            kvRoot: kvRoot,
+            configuredCeiling: BatchScheduler.prefixCacheGlobalDiskCeiling())
         self.powerAssertion = InferencePowerAssertion(reason: "Darkbloom inference job active")
         self.preloadTaskStarted = preloadTaskStarted
         self.beforeModelLoad = beforeModelLoad
@@ -497,6 +506,8 @@ public actor ProviderLoop {
             await cancelAllInflight()
         }
         await coordinator.shutdown()
+        // Phase 3: shutdown the global disk accountant.
+        await diskAccountant.shutdown()
         while !modelSlots.isEmpty {
             if let unloading = modelsUnloading.first {
                 await waitForModelUnload(unloading)
@@ -685,6 +696,10 @@ public actor ProviderLoop {
         // Harmony reads it to set the reasoning budget; other models
         // ignore the extra template variable.
         let reasoningEffort = Self.extractReasoningEffort(from: decryptedData)
+        // Per-tenant prefix-cache scope (prompt_cache_key / user). Decoded from
+        // the sealed body like reasoning_effort; threaded into the engine so the
+        // checkpoint cache is partitioned per consumer. "" ⇒ unscoped.
+        let cacheScope = Self.extractCacheScope(from: decryptedData)
 
         // 3. Fast pre-accept admission check. The coordinator accepts fast and
         // then waits for the first chunk with the full inference timeout, so we
@@ -826,7 +841,8 @@ public actor ProviderLoop {
                 reserveModel: { _ in },
                 releaseModel: { _ in },
                 defaultMaxTokens: Self.schedulerDefaultMaxTokens,
-                reasoningEffort: reasoningEffort
+                reasoningEffort: reasoningEffort,
+                cacheScope: cacheScope
             )
 
             // Force-stream so we get SSE frames even if the original request
@@ -1687,9 +1703,10 @@ public actor ProviderLoop {
                 maxConcurrentRequests: Self.schedulerMaxConcurrent,
                 pendingTimeout: Self.schedulerPendingTimeout,
                 defaultMaxTokens: Self.schedulerDefaultMaxTokens,
-                kvBudget: kvBudget
+                kvBudget: kvBudget,
+                diskAccountant: diskAccountant
             )
-            await scheduler.loadModel(container: container, modelId: modelId)
+            await scheduler.loadModel(container: container, modelId: modelId, weightHash: modelInfo.weightHash)
             if isShuttingDown || Task.isCancelled {
                 await scheduler.unloadModel()
                 throw CancellationError()

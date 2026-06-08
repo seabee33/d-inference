@@ -66,7 +66,11 @@ private func osStatus(from cfError: Unmanaged<CFError>?) -> OSStatus {
 // MARK: - PersistentEnclaveKey
 
 public final class PersistentEnclaveKey: @unchecked Sendable {
-    private let privateKey: SecKey
+    /// The SE-backed P-256 SecKey. Module-internal so the
+    /// `PersistentEnclaveKey+ECIES` extension can call
+    /// `SecKeyCreateDecryptedData` on it; the SE still owns the
+    /// private material, this reference is just the handle.
+    internal let privateKey: SecKey
     private let _publicKeyRaw: Data
 
     /// Default access group. The team ID prefix is hardcoded because codesign
@@ -265,6 +269,57 @@ public final class PersistentEnclaveKey: @unchecked Sendable {
             throw PersistentEnclaveKeyError.keyLookupFailed(status: status)
         }
     }
+
+    // MARK: - Transient (non-persisted) key
+
+    #if DEBUG
+    /// Create a TRANSIENT Secure Enclave key: generated in the SE but
+    /// NOT stored in the keychain (`kSecAttrIsPermanent: false`, no
+    /// access group). Because nothing touches a keychain access group,
+    /// this needs **no `keychain-access-groups` entitlement** — so it
+    /// runs from unsigned/ad-hoc builds, unlike `loadOrCreate`.
+    ///
+    /// Use it to exercise the SE crypto itself (sign / ECIES wrap+unwrap)
+    /// on real hardware without code signing. The key is ephemeral —
+    /// it's gone when the returned object is released — so it does NOT
+    /// validate keychain persistence (that path is the same SecItem
+    /// storage the production attestation key already uses).
+    ///
+    /// `#if DEBUG`-gated so it is COMPILED OUT of release builds — it's a
+    /// test-only helper (only `kv-se-harness` uses it), and excluding it
+    /// from release keeps the entitlement-free SE-key path out of shipped
+    /// binaries entirely (defense-in-depth; the real gate is coordinator-
+    /// side attestation, which a transient key can't satisfy anyway).
+    public static func makeTransient() throws -> PersistentEnclaveKey {
+        guard isAvailable else {
+            throw PersistentEnclaveKeyError.secureEnclaveUnavailable
+        }
+        var acError: Unmanaged<CFError>?
+        guard let accessControl = SecAccessControlCreateWithFlags(
+            kCFAllocatorDefault,
+            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            .privateKeyUsage,
+            &acError
+        ) else {
+            throw PersistentEnclaveKeyError.accessControlCreationFailed(
+                status: osStatus(from: acError))
+        }
+        let attributes: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecAttrKeySizeInBits as String: 256,
+            kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
+            kSecPrivateKeyAttrs as String: [
+                kSecAttrIsPermanent as String: false,  // NOT stored → no access group → no entitlement
+                kSecAttrAccessControl as String: accessControl,
+            ],
+        ]
+        var createError: Unmanaged<CFError>?
+        guard let privateKey = SecKeyCreateRandomKey(attributes as CFDictionary, &createError) else {
+            throw PersistentEnclaveKeyError.keyCreationFailed(status: osStatus(from: createError))
+        }
+        return try PersistentEnclaveKey(privateKey: privateKey)
+    }
+    #endif
 
     // MARK: - Create New
 
