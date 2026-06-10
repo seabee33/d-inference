@@ -68,8 +68,10 @@ func testMakeTextRoutable(p *Provider) {
 }
 
 // TestCodeAttestationGate verifies the v0.6.0 APNs code-identity gate at the
-// single routing chokepoint: off by default (rollout flag), fail-closed when
-// required-but-unattested, routable once attested.
+// single routing chokepoint across the rollout policy: not configured (no
+// regression), grace/observe (configured but un-enforced still routes), enforced
+// (fail-closed when un-attested, routable when attested), and a live grace→enforce
+// deadline flip that does NOT require the provider to reconnect.
 func TestCodeAttestationGate(t *testing.T) {
 	mk := func() *Provider {
 		p := &Provider{
@@ -88,24 +90,61 @@ func TestCodeAttestationGate(t *testing.T) {
 		return p
 	}
 
-	// Rollout flag OFF: routable regardless of CodeAttested (no fleet regression).
-	if p := mk(); !providerSupportsPrivateTextLocked(p) {
-		t.Fatal("expected routable when codeAttestationRequired is off")
+	// Evaluate the gate under r.mu exactly as real callers do.
+	supports := func(r *Registry, p *Provider) bool {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		return r.providerSupportsPrivateTextLocked(p)
 	}
 
-	// Rollout flag ON, not attested: blocked (fail-closed, no self-route exemption).
+	// Not configured: routable regardless of CodeAttested (no fleet regression).
+	r := New(testLogger())
+	if !supports(r, mk()) {
+		t.Fatal("expected routable when code-attestation is not configured")
+	}
+
+	// Configured, no deadline (grace/observe): un-attested still routes.
+	r = New(testLogger())
+	r.SetCodeAttestationPolicy(true, time.Time{})
+	if !supports(r, mk()) {
+		t.Fatal("expected routable in grace mode (configured, no deadline) even when !CodeAttested")
+	}
+
+	// Configured, deadline in the future (still grace): un-attested still routes.
+	r = New(testLogger())
+	r.SetCodeAttestationPolicy(true, time.Now().Add(time.Hour))
+	if !supports(r, mk()) {
+		t.Fatal("expected routable while still inside the grace window")
+	}
+
+	// Enforced (deadline passed), not attested: blocked (fail-closed).
+	r = New(testLogger())
+	r.SetCodeAttestationPolicy(true, time.Now().Add(-time.Minute))
+	if supports(r, mk()) {
+		t.Fatal("expected NOT routable once enforced and !CodeAttested")
+	}
+
+	// Enforced and attested: routable.
+	r = New(testLogger())
+	r.SetCodeAttestationPolicy(true, time.Now().Add(-time.Minute))
+	pAtt := mk()
+	pAtt.CodeAttested = true
+	if !supports(r, pAtt) {
+		t.Fatal("expected routable when enforced and CodeAttested")
+	}
+
+	// Live deadline flip without reconnect: the SAME un-attested provider routes
+	// during grace, then stops the instant the deadline moves into the past.
+	r = New(testLogger())
+	r.SetCodeAttestationConfigured(true)
+	r.SetCodeAttestationDeadline(time.Now().Add(time.Hour)) // grace
 	p := mk()
-	p.codeAttestationRequired = true
-	if providerSupportsPrivateTextLocked(p) {
-		t.Fatal("expected NOT routable when required and !CodeAttested")
+	if !supports(r, p) {
+		t.Fatal("expected routable during grace before the flip")
 	}
-
-	// Rollout flag ON, attested: routable.
-	p = mk()
-	p.codeAttestationRequired = true
-	p.CodeAttested = true
-	if !providerSupportsPrivateTextLocked(p) {
-		t.Fatal("expected routable when required and CodeAttested")
+	r.SetCodeAttestationDeadline(time.Now().Add(-time.Minute)) // enforce now
+	if supports(r, p) {
+		t.Fatal("expected NOT routable after the deadline flips to the past")
 	}
 }
 
@@ -213,6 +252,50 @@ func TestProviderWithoutChallengeVerifiedSIPExcluded(t *testing.T) {
 	}
 }
 
+// TestVisionRoutingHelpers covers the per-provider vision capability check and
+// the fleet-level fail-fast query that gate image/video routing. With a nil
+// catalog the catalog filter allows all, so the gate reduces to "advertises this
+// model id with IsVision".
+func TestVisionRoutingHelpers(t *testing.T) {
+	r := New(testLogger())
+	visProv := &Provider{
+		ID:     "p-vis",
+		Status: StatusOnline,
+		Models: []protocol.ModelInfo{{ID: "gemma-4-26b", IsVision: true}},
+	}
+	textProv := &Provider{
+		ID:     "p-text",
+		Status: StatusOnline,
+		Models: []protocol.ModelInfo{{ID: "gemma-4-26b"}}, // text-only build of the same model
+	}
+	r.providers["p-vis"] = visProv
+	r.providers["p-text"] = textProv
+
+	r.mu.RLock()
+	visOK := r.providerServesVisionModelLocked(visProv, "gemma-4-26b")
+	textOK := r.providerServesVisionModelLocked(textProv, "gemma-4-26b")
+	r.mu.RUnlock()
+	if !visOK {
+		t.Fatal("vision provider should serve gemma-4-26b as vision-capable")
+	}
+	if textOK {
+		t.Fatal("text-only provider must NOT be vision-capable for gemma-4-26b")
+	}
+
+	if !r.HasVisionProviderForModel("gemma-4-26b") {
+		t.Fatal("fleet has a vision provider for gemma-4-26b")
+	}
+	if r.HasVisionProviderForModel("gpt-oss-20b") {
+		t.Fatal("no vision provider advertises gpt-oss-20b")
+	}
+
+	// An untrusted/offline vision provider must not satisfy the fleet check.
+	visProv.Status = StatusUntrusted
+	if r.HasVisionProviderForModel("gemma-4-26b") {
+		t.Fatal("an untrusted vision provider must not satisfy the fleet vision check")
+	}
+}
+
 func TestSwiftProviderPrivateTextWithoutPythonCaps(t *testing.T) {
 	reg := New(testLogger())
 	msg := testRegisterMessage()
@@ -223,7 +306,10 @@ func TestSwiftProviderPrivateTextWithoutPythonCaps(t *testing.T) {
 	p := reg.Register("p-swift-nopython", nil, msg)
 	testMakeTextRoutable(p)
 
-	if !providerSupportsPrivateTextLocked(p) {
+	reg.mu.RLock()
+	routable := reg.providerSupportsPrivateTextLocked(p)
+	reg.mu.RUnlock()
+	if !routable {
 		t.Fatal("Swift provider should support private text without PythonRuntimeLocked/DangerousModulesBlocked")
 	}
 
@@ -241,7 +327,10 @@ func TestPythonProviderDeprecatedNotRoutable(t *testing.T) {
 	p := reg.Register("p-python-deprecated", nil, msg)
 	testMakeTextRoutable(p)
 
-	if providerSupportsPrivateTextLocked(p) {
+	reg.mu.RLock()
+	routable := reg.providerSupportsPrivateTextLocked(p)
+	reg.mu.RUnlock()
+	if routable {
 		t.Fatal("Python (inprocess-mlx) provider should NOT support private text — backend is deprecated")
 	}
 
@@ -262,7 +351,10 @@ func TestSwiftProviderMissingBaseCapsExcluded(t *testing.T) {
 	p := reg.Register("p-swift-no-antidebug", nil, msg)
 	testMakeTextRoutable(p)
 
-	if providerSupportsPrivateTextLocked(p) {
+	reg.mu.RLock()
+	routable := reg.providerSupportsPrivateTextLocked(p)
+	reg.mu.RUnlock()
+	if routable {
 		t.Fatal("Swift provider without AntiDebugEnabled should NOT support private text")
 	}
 
@@ -2903,5 +2995,51 @@ func TestFindProviderCrashedOnlyStillRoutes(t *testing.T) {
 	found := reg.FindProvider(model)
 	if found == nil {
 		t.Error("FindProvider should still route to a crashed-only provider (it can attempt reload)")
+	}
+}
+
+// TestDesiredModelsForLegacyAdvertiserAfterTakeover proves the 4-bit cutover
+// bootstrap: after an alias adopts the live public name (desired = new build,
+// previous = the legacy same-named build), a provider advertising ONLY the legacy
+// build is recognised as a member and told to converge to the new build via
+// desired_models — without which the legacy fleet could never migrate.
+func TestDesiredModelsForLegacyAdvertiserAfterTakeover(t *testing.T) {
+	r := New(testLogger())
+	r.providers["p1"] = &Provider{
+		ID:     "p1",
+		Status: StatusOnline,
+		Models: []protocol.ModelInfo{{ID: "gemma-4-26b"}}, // advertises the public name
+	}
+	r.SetModelAliases(map[string]AliasTarget{
+		"gemma-4-26b": {Desired: "gemma-4-26b-qat-4bit", Previous: "gemma-4-26b"},
+	})
+
+	entries := r.DesiredModelsForProvider("p1")
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 desired_models entry for the legacy advertiser, got %d", len(entries))
+	}
+	if entries[0].ModelName != "gemma-4-26b" || entries[0].DesiredBuild != "gemma-4-26b-qat-4bit" {
+		t.Fatalf("unexpected desired entry: %+v", entries[0])
+	}
+	if entries[0].PreviousBuild != "gemma-4-26b" {
+		t.Fatalf("expected previous build = legacy id, got %q", entries[0].PreviousBuild)
+	}
+}
+
+// TestCodeAttestationCoverage verifies the operator-facing coverage counter used
+// to judge when it is safe to let APNS_ENFORCE_AFTER pass.
+func TestCodeAttestationCoverage(t *testing.T) {
+	r := New(testLogger())
+	r.providers["a"] = &Provider{ID: "a", Status: StatusOnline, CodeAttested: true}
+	r.providers["b"] = &Provider{ID: "b", Status: StatusOnline, CodeAttested: false}
+	r.providers["c"] = &Provider{ID: "c", Status: StatusUntrusted, CodeAttested: true} // excluded
+	r.providers["d"] = &Provider{ID: "d", Status: StatusOffline, CodeAttested: true}   // excluded
+
+	attested, online := r.CodeAttestationCoverage()
+	if online != 2 {
+		t.Fatalf("expected 2 online (non-offline/untrusted), got %d", online)
+	}
+	if attested != 1 {
+		t.Fatalf("expected 1 code-attested online provider, got %d", attested)
 	}
 }

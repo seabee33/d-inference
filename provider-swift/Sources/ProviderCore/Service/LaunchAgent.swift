@@ -70,8 +70,10 @@ public enum LaunchAgent: Sendable {
     ///
     /// If the service is already loaded it is unloaded first to pick up
     /// any plist changes. The plist is written with:
-    ///   - KeepAlive = false (no auto-restart on crash)
-    ///   - RunAtLoad = false (no auto-start on login)
+    ///   - KeepAlive = false (no auto-restart on crash; avoids racing the updater)
+    ///   - RunAtLoad = true (auto-start when the GUI session loads, i.e. at login —
+    ///     at boot on an auto-login box — so a rebooted provider re-attests via APNs
+    ///     without a manual `darkbloom start`)
     ///   - ProcessType = Interactive (high priority for real-time inference)
     ///   - Nice = -5 (slight scheduling boost)
     ///
@@ -214,6 +216,24 @@ public enum LaunchAgent: Sendable {
 
     // MARK: - Private
 
+    /// Env vars passed through from the installing shell into the launchd plist's
+    /// `EnvironmentVariables`. Kept to a small allowlist so the daemon's
+    /// environment stays predictable; only non-empty values are forwarded.
+    static let passthroughEnvKeys = ["DARKBLOOM_PREFIX_CACHE"]
+
+    /// Build the daemon `EnvironmentVariables` map from a source environment,
+    /// keeping only the allowlisted, non-empty keys. Pure (environment injected)
+    /// so it is unit-testable without touching the real process environment.
+    static func passthroughEnvironment(from environment: [String: String]) -> [String: String] {
+        var out: [String: String] = [:]
+        for key in passthroughEnvKeys {
+            if let value = environment[key], !value.isEmpty {
+                out[key] = value
+            }
+        }
+        return out
+    }
+
     private static func writePlist(
         binaryPath: String,
         coordinatorURL: String,
@@ -255,16 +275,12 @@ public enum LaunchAgent: Sendable {
             }
         }
 
-        let plistDict: [String: Any] = [
-            "Label": label,
-            "ProgramArguments": programArguments,
-            "KeepAlive": false,
-            "RunAtLoad": false,
-            "StandardOutPath": log,
-            "StandardErrorPath": log,
-            "ProcessType": "Interactive",
-            "Nice": -5,
-        ]
+        let plistDict = makeServicePlist(
+            label: label,
+            programArguments: programArguments,
+            logPath: log,
+            environment: ProcessInfo.processInfo.environment
+        )
 
         let data = try PropertyListSerialization.data(
             fromPropertyList: plistDict,
@@ -272,6 +288,48 @@ public enum LaunchAgent: Sendable {
             options: 0
         )
         try data.write(to: plist, options: .atomic)
+    }
+
+    /// Build the launchd plist dictionary for the provider service. Pure (no I/O)
+    /// so the auto-start and environment-passthrough behavior is unit-testable.
+    ///
+    /// `RunAtLoad = true`: launchd starts the provider as soon as the GUI session
+    /// loads the agent — i.e. at login, which on an auto-login box is at boot. This
+    /// is what lets a rebooted/power-cycled provider come back and re-attest via
+    /// APNs with no human running `darkbloom start`. (APNs registration needs the
+    /// GUI/Aqua session, which a gui-domain LaunchAgent already runs in.)
+    ///
+    /// `KeepAlive = false` is deliberate: unconditional KeepAlive would have launchd
+    /// relaunch the process the instant the graceful self-updater stops it to swap
+    /// the binary, racing the stage-then-swap. Crash-recovery is handled separately.
+    static func makeServicePlist(
+        label: String,
+        programArguments: [String],
+        logPath: String,
+        environment: [String: String]
+    ) -> [String: Any] {
+        var plistDict: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": programArguments,
+            "KeepAlive": false,
+            "RunAtLoad": true,
+            "StandardOutPath": logPath,
+            "StandardErrorPath": logPath,
+            "ProcessType": "Interactive",
+            "Nice": -5,
+        ]
+
+        // launchd does NOT inherit the installing shell's environment, so any
+        // opt-out the operator set (e.g. DARKBLOOM_PREFIX_CACHE=0 to disable the
+        // on-by-default encrypted SSD KV cache) would be silently ignored by the
+        // daemon. Persist the allowlisted passthrough vars into the plist so the
+        // operator actually has a per-machine off switch.
+        let environmentVariables = passthroughEnvironment(from: environment)
+        if !environmentVariables.isEmpty {
+            plistDict["EnvironmentVariables"] = environmentVariables
+        }
+
+        return plistDict
     }
 
     private static func loadService() throws {

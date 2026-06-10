@@ -239,6 +239,7 @@ func (s *Server) dispatchOneProvider(
 	reservedMicroUSD int64,
 	estimatedPromptTokens int,
 	requestedMaxTokens int,
+	requiresVision bool,
 	allowedProviderSerials []string,
 	isResponsesAPI bool,
 	policy selfRoutePolicy,
@@ -263,6 +264,7 @@ func (s *Server) dispatchOneProvider(
 		ConsumerLocation:       consumerLocation,
 		IsResponsesAPI:         isResponsesAPI,
 		EstimatedPromptTokens:  estimatedPromptTokens,
+		RequiresVision:         requiresVision,
 		RequestedMaxTokens:     requestedMaxTokens,
 		ReservedMicroUSD:       reservedMicroUSD,
 		BaseReservedMicroUSD:   reservedMicroUSD,
@@ -503,7 +505,7 @@ func approximateTokenCountUpperBound(v any) int {
 func estimatePromptTokens(parsed map[string]any) int {
 	total := 0
 	if v, ok := parsed["messages"]; ok {
-		total += approximateTokenCount(v)
+		total += messagesPromptTokens(v)
 	}
 	if v, ok := parsed["input"]; ok {
 		total += approximateTokenCount(v)
@@ -524,6 +526,13 @@ func estimatePromptTokens(parsed map[string]any) int {
 func estimateBillingPromptTokens(parsed map[string]any) int {
 	total := 0
 	if v, ok := parsed["messages"]; ok {
+		// Billing MUST stay a guaranteed upper bound (len(bytes) >= tokens for any
+		// BPE tokenizer), so it keeps counting full message bytes — including a
+		// base64 image's bytes and every non-content field (role, tool_calls,
+		// name). Switching to the media-aware flat count here would DROP those
+		// fields and under-reserve for tool-calling requests. Over-reservation on a
+		// large image is safe (it is refunded after inference); the routing/ITPM
+		// estimate (estimatePromptTokens) is the media-aware one.
 		total += approximateTokenCountUpperBound(v)
 	}
 	if v, ok := parsed["input"]; ok {
@@ -536,6 +545,141 @@ func estimateBillingPromptTokens(parsed map[string]any) int {
 		total = approximateTokenCountUpperBound(parsed)
 	}
 	return total
+}
+
+// Media prompt-token costs. A vision encoder turns each image/video into a
+// bounded number of soft tokens (Gemma 4 caps around a few hundred per image)
+// regardless of the base64 byte length, so counting a `data:` URI as text
+// inflates the estimate by orders of magnitude — distorting routing admission and
+// over-reserving balance. These flat per-media costs keep both sane.
+const (
+	imagePromptTokenCost = 300
+	videoPromptTokenCost = 1500
+)
+
+// isMediaPartType reports whether an OpenAI/OpenRouter content-part type denotes
+// image or video input.
+func isMediaPartType(t string) bool {
+	switch t {
+	// OpenAI chat (image_url/video_url), OpenAI Responses (input_image/input_video),
+	// and Anthropic /v1/messages content blocks ({"type":"image"|"video","source":…}).
+	case "image_url", "input_image", "image", "video_url", "input_video", "video":
+		return true
+	}
+	return false
+}
+
+// messageContentTokens estimates ROUTING prompt tokens for one message's
+// `content`, counting text parts as text (len/4) and each image/video part as a
+// flat media cost (never the base64 length). Used only for the routing/ITPM
+// estimate; billing uses approximateTokenCountUpperBound (a guaranteed upper
+// bound that intentionally still counts the base64 bytes).
+func messageContentTokens(content any) int {
+	textTokens := func(s string) int {
+		if s == "" {
+			return 0
+		}
+		if t := len(s) / 4; t > 0 {
+			return t
+		}
+		return 1
+	}
+	switch c := content.(type) {
+	case string:
+		return textTokens(c)
+	case []any:
+		total := 0
+		for _, part := range c {
+			pm, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			typ, _ := pm["type"].(string)
+			switch {
+			case typ == "text":
+				if s, ok := pm["text"].(string); ok {
+					total += textTokens(s)
+				}
+			case typ == "image_url" || typ == "input_image" || typ == "image":
+				total += imagePromptTokenCost
+			case typ == "video_url" || typ == "input_video" || typ == "video":
+				total += videoPromptTokenCost
+			default:
+				if b, err := json.Marshal(pm); err == nil {
+					total += len(b) / 4
+				}
+			}
+		}
+		return total
+	default:
+		return approximateTokenCount(content)
+	}
+}
+
+// messagesPromptTokens sums media-aware routing content tokens across a messages
+// array. Falls back to the len/4 heuristic when messages isn't the standard
+// array shape.
+func messagesPromptTokens(messages any) int {
+	arr, ok := messages.([]any)
+	if !ok {
+		return approximateTokenCount(messages)
+	}
+	total := 0
+	for _, m := range arr {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			total += approximateTokenCount(m)
+			continue
+		}
+		total += 4 // small per-message framing (role + delimiters)
+		total += messageContentTokens(mm["content"])
+	}
+	return total
+}
+
+// contentPartsHaveMedia reports whether a `content` value (a content-part array)
+// carries any image/video part.
+func contentPartsHaveMedia(content any) bool {
+	parts, ok := content.([]any)
+	if !ok {
+		return false
+	}
+	for _, part := range parts {
+		pm, ok := part.(map[string]any)
+		if !ok {
+			continue
+		}
+		if typ, _ := pm["type"].(string); isMediaPartType(typ) {
+			return true
+		}
+	}
+	return false
+}
+
+// detectMediaRequirement reports whether the request carries image/video input.
+// The coordinator sees plaintext at this point (sealedTransport decrypts before
+// the handler), so this drives the vision routing gate and the fail-fast "no
+// vision-capable provider" response. It scans both the Chat Completions
+// `messages[].content` parts and the Responses API `input[].content` parts so a
+// media request on either surface is gated (never silently routed text-blind).
+func detectMediaRequirement(parsed map[string]any) bool {
+	if messages, ok := parsed["messages"].([]any); ok {
+		for _, m := range messages {
+			if mm, ok := m.(map[string]any); ok && contentPartsHaveMedia(mm["content"]) {
+				return true
+			}
+		}
+	}
+	// Responses API: `input` may be a string (no media) or an array of items,
+	// each carrying `content` parts in the same image_url/input_image shape.
+	if input, ok := parsed["input"].([]any); ok {
+		for _, item := range input {
+			if im, ok := item.(map[string]any); ok && contentPartsHaveMedia(im["content"]) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func estimateRequestedMaxTokens(parsed map[string]any) int {
@@ -1103,6 +1247,32 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	model, rawBody = buildModel, resolvedBody
 
+	// Vision gating: a request carrying image/video input must land on a provider
+	// advertising a vision-capable (VLM) build of this model, or the media is
+	// silently dropped and the answer is image-blind. Fail fast with a clear error
+	// when the fleet has no such provider (e.g. before the gemma fleet finishes
+	// updating to 0.6.0); the routing layer enforces the same gate per dispatch.
+	requiresVision := detectMediaRequirement(parsed)
+	if requiresVision {
+		// The Responses API path lowers `input` to chat messages via
+		// responsesRequestToChatCompletions, which does NOT carry image/video parts
+		// through — so a media request there would be routed and then silently
+		// stripped (image-blind). Reject it cleanly until that conversion preserves
+		// media (tracked follow-up); the console uses /v1/chat/completions for images.
+		if input != nil && len(messages) == 0 {
+			writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error",
+				"image/video input via the Responses API is not supported yet; use /v1/chat/completions",
+				withParam("input")))
+			return
+		}
+		if !s.registry.HasVisionProviderForModel(model) {
+			writeJSON(w, http.StatusServiceUnavailable, errorResponse("model_unavailable",
+				fmt.Sprintf("model %q has no vision-capable provider available for image/video input right now", publicModel),
+				withParam("model")))
+			return
+		}
+	}
+
 	isResponsesAPI := input != nil && len(messages) == 0
 
 	// Inject model-specific defaults from the registry: reasoning_parser
@@ -1310,7 +1480,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		var dispatchErrCode int
 		provider, pr, _, dispatchErr, dispatchErrCode = s.dispatchOneProvider(
 			r, model, publicModel, rawBody, consumerKey, consumerLocation, reservedMicroUSD,
-			estimatedPromptTokens, requestedMaxTokens, allowedProviderSerials,
+			estimatedPromptTokens, requestedMaxTokens, requiresVision, allowedProviderSerials,
 			isResponsesAPI, policy, timing, excludeProviders,
 		)
 		if provider == nil {
@@ -1361,6 +1531,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				ConsumerLocation:       consumerLocation,
 				IsResponsesAPI:         isResponsesAPI,
 				EstimatedPromptTokens:  estimatedPromptTokens,
+				RequiresVision:         requiresVision,
 				RequestedMaxTokens:     requestedMaxTokens,
 				ReservedMicroUSD:       reservedMicroUSD,
 				BaseReservedMicroUSD:   reservedMicroUSD,
@@ -1662,7 +1833,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 				backupProvider, backupPR, _, _, _ = s.dispatchOneProvider(
 					r, model, publicModel, rawBody, consumerKey, consumerLocation, reservedMicroUSD,
-					estimatedPromptTokens, requestedMaxTokens, allowedProviderSerials,
+					estimatedPromptTokens, requestedMaxTokens, requiresVision, allowedProviderSerials,
 					isResponsesAPI, policy, &registry.RequestTiming{ReceivedAt: timing.ReceivedAt},
 					backupExclude,
 				)
@@ -4306,6 +4477,16 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	// Vision gating (see handleChatCompletions): a media request must land on a
+	// vision-capable provider, or fail fast when none exists.
+	requiresVision := detectMediaRequirement(parsed)
+	if requiresVision && !s.registry.HasVisionProviderForModel(model) {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse("model_unavailable",
+			fmt.Sprintf("model %q has no vision-capable provider available for image/video input right now", publicModel),
+			withParam("model")))
+		return
+	}
+
 	// Completions and Anthropic messages both use the max_tokens field (never
 	// max_output_tokens, which is Responses API only). Inject a default if
 	// unset so the pre-flight reservation bounds the generation.
@@ -4420,6 +4601,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		OwnerAccountID:         policy.ownerAccountID,
 		FreeSelfRoute:          policy.enabled,
 		EstimatedPromptTokens:  estimatedPromptTokens,
+		RequiresVision:         requiresVision,
 		RequestedMaxTokens:     requestedMaxTokens,
 		ReservedMicroUSD:       reservedMicroUSD,
 		BaseReservedMicroUSD:   reservedMicroUSD,
