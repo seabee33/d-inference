@@ -572,3 +572,315 @@ func managerScopedSSDRoundtripAndIsolation() async throws {
     let stats = await mgr.snapshotStats()
     #expect(stats.ssdReadErrors == 0)
 }
+
+// MARK: - Sliding SSD TTL
+
+// SSD manager with a controllable clock + TTL. RAM is wiped between writes and
+// reads so every read must consult SSD (where TTL is enforced).
+private func makeTTLManager(ttl: Int64, clock: MonotonicClock, dir: URL? = nil,
+                            kek: KVCacheKEK? = nil)
+    -> (PrefixCacheManager, URL) {
+    let cacheDir = dir ?? tmpDir()
+    let mgr = PrefixCacheManager(
+        binding: binding(model: "m"),
+        ram: PrefixCacheRAM(),
+        index: PrefixCacheIndex(fileURL: cacheDir.appendingPathComponent("index.json")),
+        kek: kek ?? KVCacheKEK(wrapper: InMemoryKeyWrappingService(),
+                               storage: InMemoryWrappedKEKStorage(identifier: UUID().uuidString)),
+        cacheDir: cacheDir, ssdEnabled: true,
+        boundaries: [4, 8],
+        ttlSeconds: ttl,
+        now: { clock.value },
+        modelKey: "test-model"
+    )
+    return (mgr, cacheDir)
+}
+
+@Test
+func ttlExpiredSSDEntryIsMissAndDropped() async {
+    let clock = MonotonicClock(start: 1000)
+    let (mgr, _) = makeTTLManager(ttl: 300, clock: clock)
+    let tokens = prompt(10)
+    await mgr.store(tokens: tokens, checkpointLength: 8,
+                    caches: SendableKVCaches(attnCaches(layers: 2, tokens: 8)))
+    _ = await mgr.flushToSSD()
+    await mgr.clearRAM()
+    // Within TTL ⇒ SSD hit.
+    clock.advance(299)
+    #expect(await mgr.lookup(tokens: tokens)?.tier == .ssd, "within TTL should hit SSD")
+    // The hit slid lastHitAt to now (=1299). Wipe RAM, advance past TTL ⇒ expired.
+    await mgr.clearRAM()
+    clock.advance(301)  // now 1600; lastHitAt 1299; 301 > 300
+    #expect(await mgr.lookup(tokens: tokens) == nil, "past TTL should miss")
+    let s = await mgr.snapshotStats()
+    #expect(s.ttlExpirations >= 1, "expired entry should be counted + dropped")
+    // Dropped: a subsequent lookup is still a miss (file gone), no read error churn.
+    #expect(await mgr.lookup(tokens: tokens) == nil)
+}
+
+@Test
+func ttlSlidingRefreshKeepsHotEntryAlive() async {
+    let clock = MonotonicClock(start: 1000)
+    let (mgr, _) = makeTTLManager(ttl: 300, clock: clock)
+    let tokens = prompt(10)
+    await mgr.store(tokens: tokens, checkpointLength: 8,
+                    caches: SendableKVCaches(attnCaches(layers: 2, tokens: 8)))
+    _ = await mgr.flushToSSD()
+    // Hit every 200s for 5 windows (total 1000s >> ttl); each hit slides lastHitAt.
+    for _ in 0..<5 {
+        await mgr.clearRAM()
+        clock.advance(200)
+        #expect(await mgr.lookup(tokens: tokens)?.tier == .ssd, "sliding refresh should keep it alive")
+    }
+    let s = await mgr.snapshotStats()
+    #expect(s.ttlExpirations == 0, "a continuously-hit entry must never expire")
+}
+
+@Test
+func ttlDisabledNeverExpires() async {
+    let clock = MonotonicClock(start: 1000)
+    let (mgr, _) = makeTTLManager(ttl: 0, clock: clock)   // 0 = infinite
+    let tokens = prompt(10)
+    await mgr.store(tokens: tokens, checkpointLength: 8,
+                    caches: SendableKVCaches(attnCaches(layers: 2, tokens: 8)))
+    _ = await mgr.flushToSSD()
+    await mgr.clearRAM()
+    clock.advance(10_000_000)  // way past any TTL
+    #expect(await mgr.lookup(tokens: tokens)?.tier == .ssd, "ttl=0 ⇒ never expires")
+    #expect(await mgr.snapshotStats().ttlExpirations == 0)
+}
+
+@Test
+func ttlReconcileReapsExpiredOrphan() async throws {
+    let clock = MonotonicClock(start: 1000)
+    let dir = tmpDir()
+    // Manager 1 writes an entry.
+    let (m1, _) = makeTTLManager(ttl: 300, clock: clock, dir: dir)
+    let tokens = prompt(10)
+    await m1.store(tokens: tokens, checkpointLength: 8,
+                   caches: SendableKVCaches(attnCaches(layers: 2, tokens: 8)))
+    _ = await m1.flushToSSD()
+
+    // Time passes well beyond TTL, then a NEW manager reconciles the dir.
+    clock.advance(1000)  // 1000s > 300 ttl since createdAt=1000
+    let (m2, _) = makeTTLManager(ttl: 300, clock: clock, dir: dir)
+    await m2.reconcileWithDisk()
+    // The expired entry must be reaped, so a lookup misses (no resurrected file).
+    await m2.clearRAM()
+    #expect(await m2.lookup(tokens: tokens) == nil, "reconcile must reap the expired orphan")
+    #expect(await m2.snapshotStats().ttlExpirations >= 1)
+}
+
+@Test
+func ttlReconcileReapsExpiredIndexedEntry() async throws {
+    // INDEX-path reap (vs the orphan-path above): persist the index so the new
+    // manager loads the entry IN its index, then reconcile's reapExpired drops it.
+    let clock = MonotonicClock(start: 1000)
+    let dir = tmpDir()
+    let (m1, _) = makeTTLManager(ttl: 300, clock: clock, dir: dir)
+    let tokens = prompt(10)
+    await m1.store(tokens: tokens, checkpointLength: 8,
+                   caches: SendableKVCaches(attnCaches(layers: 2, tokens: 8)))
+    _ = await m1.flushToSSD()
+    await m1.flushIndexNow()   // persist index.json so m2 loads the entry (not an orphan)
+
+    clock.advance(1000)        // 1000s > 300 ttl
+    let (m2, _) = makeTTLManager(ttl: 300, clock: clock, dir: dir)
+    await m2.reconcileWithDisk()   // reapExpired drops the indexed-but-expired entry
+    await m2.clearRAM()
+    #expect(await m2.lookup(tokens: tokens) == nil, "reconcile must reap the expired indexed entry")
+    #expect(await m2.snapshotStats().ttlExpirations >= 1)
+}
+
+@Test
+func ttlRamHitSlidesSSDRecency() async {
+    // PR #290 review (Codex r3377288873): a RAM-resident prefix served past the
+    // TTL must NOT be reaped from SSD when RAM pressure later evicts it — every
+    // RAM hit slides the SSD entry's lastHitAt (use = RAM serves too).
+    let clock = MonotonicClock(start: 1000)
+    let (mgr, _) = makeTTLManager(ttl: 300, clock: clock)
+    let tokens = prompt(10)
+    await mgr.store(tokens: tokens, checkpointLength: 8,
+                    caches: SendableKVCaches(attnCaches(layers: 2, tokens: 8)))
+    _ = await mgr.flushToSSD()   // SSD entry exists, lastHitAt = 1000
+
+    // Serve from RAM 5 times, 200s apart — each gap < TTL, but cumulatively
+    // 1000s past the SSD entry's original lastHitAt.
+    for _ in 0..<5 {
+        clock.advance(200)
+        #expect(await mgr.lookup(tokens: tokens)?.tier == .ram, "stays RAM-hot")
+    }
+
+    // RAM pressure evicts; next lookup falls through to SSD 100s after the
+    // last RAM serve. Without the RAM-hit touch, lastHitAt is still 1000
+    // (1100s stale > 300s TTL) and the hot entry is wrongly reaped.
+    await mgr.clearRAM()
+    clock.advance(100)
+    let hit = await mgr.lookup(tokens: tokens)
+    #expect(hit?.tier == .ssd, "RAM-hot entry must survive RAM eviction (TTL slid by RAM hits)")
+    #expect(await mgr.snapshotStats().ttlExpirations == 0, "nothing should have expired")
+}
+
+@Test
+func ttlReconcileReapsLegacyOrphanWithoutExpiresAt() async throws {
+    // PR #290 review (Codex r3377288876): files written BEFORE the TTL existed
+    // (or while it was disabled) carry expiresAt == nil. Reconcile must treat
+    // them as createdAt + ttl — identical to what expiresAtForWrite stamps on
+    // new files — not resurrect stale prompt-derived KV past the privacy window.
+    let clock = MonotonicClock(start: 1000)
+    let dir = tmpDir()
+    // Writer with TTL DISABLED ⇒ file metadata has expiresAt == nil (the exact
+    // legacy shape). A single flush stays under the index save-coalesce
+    // threshold, so the index is never persisted → the file is an ORPHAN for
+    // the next manager.
+    let (m1, _) = makeTTLManager(ttl: 0, clock: clock, dir: dir)
+    let tokens = prompt(10)
+    await m1.store(tokens: tokens, checkpointLength: 8,
+                   caches: SendableKVCaches(attnCaches(layers: 2, tokens: 8)))
+    _ = await m1.flushToSSD()
+
+    clock.advance(1000)  // 1000s > 300s TTL since createdAt
+    let (m2, _) = makeTTLManager(ttl: 300, clock: clock, dir: dir)
+    await m2.reconcileWithDisk()
+
+    // Assert on the FILE, not a lookup — the lazy read-path check would also
+    // miss on a re-indexed stale entry, masking the resurrect bug.
+    let files = (try? FileManager.default.contentsOfDirectory(atPath: dir.appendingPathComponent("m").path))?
+        .filter { $0.hasSuffix(".\(EncryptedKVStore.fileExtension)") } ?? []
+    #expect(files.isEmpty, "stale legacy nil-expiresAt orphan must be deleted at reconcile, not re-indexed")
+    #expect(await m2.snapshotStats().ttlExpirations >= 1)
+}
+
+@Test
+func ttlReconcileKeepsFreshLegacyOrphan() async throws {
+    // Companion guard: a legacy (nil-expiresAt) orphan that is YOUNGER than
+    // the TTL must still be re-indexed normally — the nil-handling must not
+    // over-delete fresh files.
+    let clock = MonotonicClock(start: 1000)
+    let dir = tmpDir()
+    // Share one KEK across both managers (a restart keeps the persisted KEK;
+    // per-manager random KEKs would make the decrypt fail for harness reasons).
+    let sharedKEK = KVCacheKEK(
+        wrapper: InMemoryKeyWrappingService(key: .init(data: Data(repeating: 7, count: 32)), identifier: "shared"),
+        storage: InMemoryWrappedKEKStorage(identifier: "legacy-orphan-fresh"))
+    let (m1, _) = makeTTLManager(ttl: 0, clock: clock, dir: dir, kek: sharedKEK)
+    let tokens = prompt(10)
+    await m1.store(tokens: tokens, checkpointLength: 8,
+                   caches: SendableKVCaches(attnCaches(layers: 2, tokens: 8)))
+    _ = await m1.flushToSSD()
+
+    clock.advance(100)  // 100s < 300s TTL
+    let (m2, _) = makeTTLManager(ttl: 300, clock: clock, dir: dir, kek: sharedKEK)
+    await m2.reconcileWithDisk()
+    await m2.clearRAM()
+    #expect(await m2.lookup(tokens: tokens)?.tier == .ssd,
+            "fresh legacy orphan must be re-indexed and servable")
+    #expect(await m2.snapshotStats().ttlExpirations == 0)
+}
+
+@Test
+func ttlExpiredLongestFallsBackToShorterCheckpoint() async {
+    // PR #290 review (Codex r3377288879): an expired LONGEST checkpoint must
+    // not mask a shorter, still-fresh one. Boundaries [4,8]: let the 8-token
+    // checkpoint go stale while the 4-token (shared system-prefix analogue)
+    // stays hot; the SSD search must reap the 8 and serve the 4.
+    let clock = MonotonicClock(start: 1000)
+    let (mgr, _) = makeTTLManager(ttl: 300, clock: clock)
+    let tokens = prompt(10)
+    await mgr.store(tokens: tokens, checkpointLength: 4,
+                    caches: SendableKVCaches(attnCaches(layers: 2, tokens: 4)))
+    await mgr.store(tokens: tokens, checkpointLength: 8,
+                    caches: SendableKVCaches(attnCaches(layers: 2, tokens: 8)))
+    _ = await mgr.flushToSSD()   // both on SSD, lastHitAt = 1000
+
+    // Keep ONLY the 4-token checkpoint warm: a 6-token prompt matches just
+    // cp4 (RAM hit → slides cp4's SSD lastHitAt to 1200 via the RAM-touch).
+    clock.advance(200)
+    #expect(await mgr.lookup(tokens: prompt(6))?.tokenCount == 4)
+
+    // t=1400: cp8 age 400s (expired), cp4 age 200s (fresh).
+    clock.advance(200)
+    await mgr.clearRAM()
+    let hit = await mgr.lookup(tokens: tokens)
+    #expect(hit?.tier == .ssd, "search must continue past the expired longest")
+    #expect(hit?.tokenCount == 4, "the still-fresh shorter checkpoint must serve")
+    let s = await mgr.snapshotStats()
+    #expect(s.ttlExpirations == 1, "exactly the stale cp8 should be reaped")
+}
+
+@Test
+func ttlEffectivelyInfiniteTTLNeverTrapsOrReaps() async {
+    // PR #290 review (Codex r3377288882/85): operators approximate "infinite
+    // retention" with huge TTL values (e.g. Int64.max). Every TTL arithmetic
+    // site must saturate, not trap: expiresAtForWrite (now + ttl), the lookup
+    // age check (now - lastHitAt vs ttl), and reapExpired's cutoff (now - ttl).
+    let clock = MonotonicClock(start: 1_700_000_000)
+    let (mgr, _) = makeTTLManager(ttl: Int64.max, clock: clock)
+    let tokens = prompt(10)
+    await mgr.store(tokens: tokens, checkpointLength: 8,
+                    caches: SendableKVCaches(attnCaches(layers: 2, tokens: 8)))
+    _ = await mgr.flushToSSD()          // expiresAtForWrite: saturates, no trap
+    await mgr.reconcileWithDisk()       // reapExpired cutoff: saturates, no trap
+    await mgr.clearRAM()
+    clock.advance(1_000_000_000)        // ~32 years pass
+    let hit = await mgr.lookup(tokens: tokens)   // age check: no trap
+    #expect(hit?.tier == .ssd, "huge TTL = effectively infinite retention")
+    #expect(await mgr.snapshotStats().ttlExpirations == 0, "nothing may be reaped")
+}
+
+@Test
+func ttlTouchRecencyPersistsAcrossCrash() async {
+    // PR #290 review (Codex r3384557425): hit-recency bumps were in-memory
+    // only — a crash after hot hits left stale persisted lastHitAt, and the
+    // restart's reconcile reaped recently-hot entries. Touches now trigger a
+    // time-coalesced index save, bounding the crash-loss window.
+    let clock = MonotonicClock(start: 1000)
+    let dir = tmpDir()
+    let sharedKEK = KVCacheKEK(
+        wrapper: InMemoryKeyWrappingService(key: .init(data: Data(repeating: 7, count: 32)), identifier: "shared"),
+        storage: InMemoryWrappedKEKStorage(identifier: "touch-persist"))
+    let (m1, _) = makeTTLManager(ttl: 300, clock: clock, dir: dir, kek: sharedKEK)
+    let tokens = prompt(10)
+    await m1.store(tokens: tokens, checkpointLength: 8,
+                   caches: SendableKVCaches(attnCaches(layers: 2, tokens: 8)))
+    _ = await m1.flushToSSD()
+    await m1.flushIndexNow()   // persisted lastHitAt = 1000
+
+    // A warm hit at t=1200 slides recency AND (coalesced) persists it.
+    clock.advance(200)
+    await m1.clearRAM()
+    #expect(await m1.lookup(tokens: tokens)?.tier == .ssd)
+
+    // CRASH: m1 abandoned without graceful teardown. Restart at t=1400 —
+    // cutoff is 1100; the persisted lastHitAt must be 1200 (the touch), not
+    // the stale 1000, or reconcile reaps a 200s-hot entry.
+    clock.advance(200)
+    let (m2, _) = makeTTLManager(ttl: 300, clock: clock, dir: dir, kek: sharedKEK)
+    await m2.reconcileWithDisk()
+    let hit = await m2.lookup(tokens: tokens)
+    #expect(hit?.tier == .ssd, "recently-hot entry must survive a crash-restart reconcile")
+    #expect(await m2.snapshotStats().ttlExpirations == 0)
+}
+
+@Test
+func ttlReapExpiredTickReapsWhileModelStaysLoaded() async {
+    // PR #290 review (Codex r3384557423): reconcile-only reaping leaves
+    // cold entries on disk for the whole model-loaded lifetime. The periodic
+    // reapExpiredTick must reclaim them with NO reconcile/restart.
+    let clock = MonotonicClock(start: 1000)
+    let (mgr, dir) = makeTTLManager(ttl: 300, clock: clock)
+    let tokens = prompt(10)
+    await mgr.store(tokens: tokens, checkpointLength: 8,
+                    caches: SendableKVCaches(attnCaches(layers: 2, tokens: 8)))
+    _ = await mgr.flushToSSD()
+
+    clock.advance(1000)  // entry is now 1000s cold (> 300s TTL)
+    await mgr.reapExpiredTick()
+
+    // Assert on the physical file + stats (RAM may still hold the entry; the
+    // tick's contract is the DISK tier).
+    let files = (try? FileManager.default.contentsOfDirectory(atPath: dir.appendingPathComponent("m").path))?
+        .filter { $0.hasSuffix(".\(EncryptedKVStore.fileExtension)") } ?? []
+    #expect(files.isEmpty, "steady-state tick must reap the cold entry without a reconcile")
+    #expect(await mgr.snapshotStats().ttlExpirations >= 1)
+}

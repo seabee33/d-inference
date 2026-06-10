@@ -103,6 +103,12 @@ public actor BatchScheduler {
     /// only — the engine tier (`EncryptedPrefixCachePersistence`) keeps no
     /// hit/miss counters, so pure-attention `.engine` models log nothing here.
     var prefixCacheStatsTask: Task<Void, Never>?
+    /// Steady-state TTL reaper (PR #290 review): reapExpired otherwise runs
+    /// only at load-time reconcile, so entries going cold while the model
+    /// stays loaded would sit on disk until restart (the lazy read-path check
+    /// fires only when the same prefix is looked up again). Started with the
+    /// engine, cancelled in `stopCurrentEngine`.
+    var ttlReapTask: Task<Void, Never>?
     /// Interval (seconds) for the stats logger. Default 120s when a checkpoint
     /// manager is active (one info line every two minutes is negligible even
     /// across a fleet, and gives hit-rate observability out of the box). A
@@ -330,6 +336,9 @@ public actor BatchScheduler {
         // Periodic checkpoint-tier hit/miss logger (no-op if disabled or
         // engine-tier model). Cancelled in stopCurrentEngine.
         startPrefixCacheStatsLogger()
+        // Steady-state TTL sweep for the checkpoint SSD tier (no-op when TTL
+        // disabled or engine-tier model). Cancelled in stopCurrentEngine.
+        startTTLReaper()
     }
 
     /// Snapshot model bytes + tokenizer + architecture out of the
@@ -596,6 +605,9 @@ public actor BatchScheduler {
                         // TB-016 sub-feature B: min persist threshold (16384
                         // for Gemma, 0 otherwise). Env override available.
                         minPersistTokens: Self.prefixCacheMinPersistTokens(arch: modelId),
+                        // Sliding SSD TTL (default 5min; 0 = infinite). Bounds
+                        // how long prompt-derived KV lingers on disk.
+                        ttlSeconds: Self.prefixCacheTTLSeconds(),
                         now: nowFn,
                         accountant: diskAccountant,
                         modelKey: backing.modelKey)
@@ -940,6 +952,23 @@ public actor BatchScheduler {
         }
         // Default: 16384 for Gemma, 0 otherwise.
         return PrefixCachePastWindow.isProven(arch: arch) ? 16384 : 0
+    }
+
+    /// Sliding TTL (seconds) for persisted SSD prefix checkpoints. Default 300
+    /// (5 min, matching Anthropic/OpenAI prompt-cache defaults); `0` disables
+    /// (infinite — capacity-driven eviction only). Operator override:
+    /// `DARKBLOOM_PREFIX_CACHE_TTL_SECONDS`.
+    static let defaultPrefixCacheTTLSeconds: Int64 = 300
+    static func prefixCacheTTLSeconds() -> Int64 {
+        resolveTTLSeconds(env: ProcessInfo.processInfo.environment["DARKBLOOM_PREFIX_CACHE_TTL_SECONDS"])
+    }
+
+    /// Pure TTL policy (testable). Unset / malformed / negative ⇒ default;
+    /// `0` ⇒ disabled (infinite); a positive value sets the sliding window.
+    static func resolveTTLSeconds(env: String?) -> Int64 {
+        guard let v = env else { return defaultPrefixCacheTTLSeconds }
+        guard let n = Int64(v), n >= 0 else { return defaultPrefixCacheTTLSeconds }
+        return n  // 0 ⇒ disabled
     }
 
     /// Set the post-load budgets driven by architecture + physical
@@ -1351,6 +1380,8 @@ public actor BatchScheduler {
         await logPrefixCacheStats()
         prefixCacheStatsTask?.cancel()
         prefixCacheStatsTask = nil
+        ttlReapTask?.cancel()
+        ttlReapTask = nil
 
         if let engine = self.engine {
             _ = engine.core.abortAllRequests()

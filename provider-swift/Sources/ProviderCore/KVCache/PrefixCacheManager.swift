@@ -124,6 +124,8 @@ public struct PrefixCacheManagerStats: Sendable, Equatable {
     public var prefixHashMismatches = 0
     public var ssdReadErrors = 0
     public var diskEvictions = 0
+    /// SSD entries dropped because they passed the sliding TTL (expired).
+    public var ttlExpirations = 0
 }
 
 // MARK: - Manager
@@ -154,6 +156,14 @@ public actor PrefixCacheManager: PrefixCacheOwner {
     /// Half-life (seconds) for recency decay in benefit-per-byte scoring.
     /// TB-016 sub-feature C: freshly-promoted entries stay hot.
     private let evictionHalfLifeSeconds: Double
+    /// Sliding TTL (seconds) for persisted SSD checkpoints. An entry is expired
+    /// when `now() - lastHitAt > ttlSeconds` (sliding: `lastHitAt` is bumped on
+    /// every hit, so hot prefixes stay warm). 0 ⇒ no TTL (infinite — legacy /
+    /// capacity-driven only). Enforced on read (loadFromSSD) and proactively
+    /// reclaimed in the disk sweep. Privacy: bounds how long KV derived from one
+    /// prompt lingers on disk, shrinking the TB-007 cross-tenant TTFT-oracle
+    /// window. SSD tier only — the RAM tier keeps its deterministic LRU.
+    private let ttlSeconds: Int64
     private let now: @Sendable () -> Int64
 
     /// Phase 3: global disk accountant (process-wide, shared across models).
@@ -206,6 +216,16 @@ public actor PrefixCacheManager: PrefixCacheOwner {
     private var unsavedWrites = 0
     /// Save the index after this many new writes (or on shutdown/idle flush).
     private static let saveCoalesceThreshold = 8
+    /// Last wall-clock second a touch-driven index save ran (PR #290 review):
+    /// hit-recency (`lastHitAt`) is bumped in memory on every RAM/SSD hit, but
+    /// without periodic persistence a crash loses those bumps and the next
+    /// restart's reconcile reaps recently-hot entries off stale timestamps.
+    /// Saves are time-coalesced (at most one per `touchSaveIntervalSeconds`),
+    /// bounding both the hot-path fsync cost and the crash-loss window.
+    private var lastTouchSaveAt: Int64 = 0
+    /// Max recency staleness a crash can cause (seconds). 60s against the 300s
+    /// default TTL means a crash under-credits an entry's recency by ≤ 20%.
+    static let touchSaveIntervalSeconds: Int64 = 60
     /// TB-016 sub-feature B: pinned digests are always eligible for
     /// persistence regardless of minPersistTokens. Internal-only (no
     /// public pin() API this phase).
@@ -270,6 +290,71 @@ public actor PrefixCacheManager: PrefixCacheOwner {
         scopeByDigest[digestHex] ?? ""
     }
 
+    /// Absolute expiry stamped into a freshly-written file's metadata:
+    /// `createdAt + ttl`, or nil when TTL is disabled. This is the EARLIEST
+    /// possible expiry (a never-hit entry, where lastHitAt == createdAt); the
+    /// live check slides off the mutable `lastHitAt` in the index, so a hit
+    /// extends effective lifetime without re-sealing the file. Informational +
+    /// a hard floor for any future offline reaper; the authoritative runtime
+    /// check is the lastHitAt comparison in loadFromSSD/sweep.
+    private func expiresAtForWrite() -> Int64? {
+        ttlSeconds > 0 ? saturatingExpiry(from: now()) : nil
+    }
+
+    /// Saturating `base + ttlSeconds`. An operator-set "effectively infinite"
+    /// TTL (e.g. Int64.max) must clamp to never-expires, not trap on overflow.
+    private func saturatingExpiry(from base: Int64) -> Int64 {
+        let (sum, overflow) = base.addingReportingOverflow(ttlSeconds)
+        return overflow ? Int64.max : sum
+    }
+
+    /// THE sliding-TTL expiry predicate — single source of truth for the read
+    /// path (loadFromSSD) and the sweeps (reapExpired). Expired when the entry
+    /// hasn't been hit within `ttlSeconds`; `lastHitAt` is bumped on every hit
+    /// (SSD loads AND RAM serves), so hot prefixes stay warm. Overflow-safe:
+    /// index.json is plaintext and can be crash-corrupted — an extreme
+    /// `lastHitAt` (e.g. Int64.min) counts as expired/reapable, never a trap.
+    /// `ttlSeconds == 0` ⇒ never expires (infinite retention).
+    private func isExpired(lastHitAt: Int64) -> Bool {
+        guard ttlSeconds > 0 else { return false }
+        let (age, overflow) = now().subtractingReportingOverflow(lastHitAt)
+        return overflow || age > ttlSeconds
+    }
+
+    /// Time-coalesced index save after a hit-recency touch (PR #290 review).
+    /// `index.touch` only mutates in memory; if the process dies before a
+    /// graceful flush, restart reconcile would reap recently-hot entries off
+    /// stale persisted timestamps. At most one save per
+    /// `touchSaveIntervalSeconds` bounds the crash-loss window without putting
+    /// an fsync on every warm request. TTL-gated: with TTL off nothing reaps
+    /// on recency, so the persistence urgency disappears.
+    private func persistRecencyIfDue(_ index: PrefixCacheIndex) {
+        guard ttlSeconds > 0, !closed, index.isDirty else { return }
+        let t = now()
+        guard t - lastTouchSaveAt >= Self.touchSaveIntervalSeconds else { return }
+        if (try? index.save()) != nil {
+            lastTouchSaveAt = t
+            unsavedWrites = 0
+        }
+    }
+
+    /// Steady-state TTL sweep (PR #290 review): reconcile-time reaping only
+    /// covers model (re)load, and the lazy read-path check only fires when the
+    /// SAME prefix is looked up again — so entries that go cold while the
+    /// model stays loaded would otherwise sit on disk until restart. Called
+    /// periodically by BatchScheduler while the engine is alive. Persists the
+    /// shrunken index and pushes the corrected footprint to the accountant
+    /// (mirroring dropUnusableSSDFile). No-op when TTL disabled / SSD off /
+    /// closed.
+    public func reapExpiredTick() async {
+        guard ssdEnabled, let index, let cacheDir else { return }
+        let before = stats.ttlExpirations
+        reapExpired(index: index, cacheDir: cacheDir)
+        guard stats.ttlExpirations > before else { return }
+        if index.isDirty { _ = try? index.save() }
+        await notifyAccountant()
+    }
+
     public init(
         binding: PrefixCacheModelBinding,
         ram: PrefixCacheRAM,
@@ -282,6 +367,7 @@ public actor PrefixCacheManager: PrefixCacheOwner {
         minPersistTokens: Int = 0,
         prefillCostPerToken: Double = 1.0,
         evictionHalfLifeSeconds: Double = 86400,
+        ttlSeconds: Int64 = 0,
         now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970) },
         accountant: GlobalDiskAccountant? = nil,
         modelKey: String = ""
@@ -300,6 +386,7 @@ public actor PrefixCacheManager: PrefixCacheOwner {
         self.minPersistTokens = minPersistTokens
         self.prefillCostPerToken = prefillCostPerToken
         self.evictionHalfLifeSeconds = evictionHalfLifeSeconds
+        self.ttlSeconds = max(0, ttlSeconds)
         self.now = now
         self.accountant = accountant
         self.modelKey = modelKey
@@ -367,16 +454,28 @@ public actor PrefixCacheManager: PrefixCacheOwner {
         for cp in checkpoints.reversed() {
             if let hit = ram.get(modelHash: binding.modelHash, digest: cp.digest) {
                 stats.ramHits += 1
-                // TB-016 sub-feature B: 2nd-use promotion. If this RAM hit is
-                // above the persist threshold and NOT already on SSD, schedule
-                // a detached promotion (no blocking the lookup actor).
                 let digestHex = cp.digest.dbkvHexString
-                if ssdEnabled,
-                   hit.tokenCount >= minPersistTokens,
-                   index?.entry(modelHash: binding.modelHash, digestHex: digestHex) == nil {
-                    let cpScope = scope
-                    Task.detached { [weak self] in
-                        await self?.persistDigest(cp.digest, scope: cpScope)
+                if ssdEnabled, let index {
+                    if index.entry(modelHash: binding.modelHash, digestHex: digestHex) != nil {
+                        // The prefix is ALSO on SSD. A RAM hit must slide the
+                        // SSD entry's lastHitAt: the sliding TTL is "time since
+                        // last use", and use includes RAM serves. Without this,
+                        // a RAM-hot prefix older than the TTL gets reaped as
+                        // "expired" the moment RAM pressure evicts it and the
+                        // next lookup falls through to SSD. Gated on TTL being
+                        // enabled so ttl=0 behavior stays byte-identical.
+                        if ttlSeconds > 0 {
+                            index.touch(modelHash: binding.modelHash, digestHex: digestHex, now: now())
+                            persistRecencyIfDue(index)
+                        }
+                    } else if hit.tokenCount >= minPersistTokens {
+                        // TB-016 sub-feature B: 2nd-use promotion. RAM hit above
+                        // the persist threshold and NOT already on SSD — schedule
+                        // a detached promotion (no blocking the lookup actor).
+                        let cpScope = scope
+                        Task.detached { [weak self] in
+                            await self?.persistDigest(cp.digest, scope: cpScope)
+                        }
                     }
                 }
                 return PrefixLookupResult(caches: hit.caches, tokenCount: hit.tokenCount, tier: .ram)
@@ -427,9 +526,38 @@ public actor PrefixCacheManager: PrefixCacheOwner {
 
     private func loadFromSSD(tokens: [Int], scope: String = "") async -> PrefixLookupResult? {
         guard let index, let kek, let cacheDir else { return nil }
-        guard let entry = index.findLongestCheckpoint(
+
+        // Sliding TTL: an entry is expired when it hasn't been hit within
+        // `ttlSeconds` (lastHitAt is bumped on every hit — SSD loads AND RAM
+        // serves — so hot prefixes stay warm). Checked BEFORE decrypt — an
+        // expired entry is reclaimed (same drop path as a corrupt file) and
+        // the search CONTINUES with the next-longest checkpoint: an expired 8k
+        // checkpoint must not mask a shorter, still-fresh one (e.g. a hot
+        // shared system-prefix). Each drop removes the entry from the index,
+        // so findLongestCheckpoint yields the next candidate; progress is
+        // guaranteed. ttlSeconds == 0 disables (infinite retention). Bounds
+        // how long prompt-derived KV survives on disk (TB-007 window shrink).
+        var selected: PrefixIndexEntry?
+        // Defensive cap: dropUnusableSSDFile no-ops when the manager closed
+        // mid-loop (it must not delete in a handed-off dir), which would
+        // otherwise refetch the same entry forever. The `closed` re-check
+        // breaks that cycle; the cap is belt-and-braces against any future
+        // drop path that leaves the entry behind.
+        var attempts = boundaries.count + 1
+        while attempts > 0, !closed, let candidate = index.findLongestCheckpoint(
             modelHash: binding.modelHash, tokens: tokens, boundaries: boundaries, scope: scope
-        ) else { return nil }
+        ) {
+            attempts -= 1
+            guard isExpired(lastHitAt: candidate.lastHitAt) else {
+                selected = candidate
+                break
+            }
+            stats.ttlExpirations += 1
+            let rel = "\(modelDirComponent)/\(candidate.digestHex).\(EncryptedKVStore.fileExtension)"
+            await dropUnusableSSDFile(
+                cacheDir.appendingPathComponent(rel), digestHex: candidate.digestHex, index: index)
+        }
+        guard let entry = selected else { return nil }
 
         // Path safety: the on-disk index JSON is plaintext and NOT
         // authenticated, so a tampered entry.relativePath could contain
@@ -541,6 +669,7 @@ public actor PrefixCacheManager: PrefixCacheOwner {
             )
         }
         index.touch(modelHash: binding.modelHash, digestHex: entry.digestHex, now: now())
+        persistRecencyIfDue(index)
 
         return PrefixLookupResult(caches: caches, tokenCount: entry.tokenCount, tier: .ssd)
     }
@@ -604,6 +733,7 @@ public actor PrefixCacheManager: PrefixCacheOwner {
                 kvHeads: binding.kvHeads, headDim: binding.headDim, tokenCount: checkpointLength,
                 tokenPrefixHash: digestHex, kvCacheClass: "mixed",
                 metaState: [layoutJSON], chunkPlaintextSizes: chunks.map { $0.count }, createdAt: now(),
+                expiresAt: expiresAtForWrite(),
                 scope: scope
             )
             try await EncryptedKVStore.write(to: fileURL, metadata: meta, chunks: chunks, kek: kek)
@@ -701,6 +831,7 @@ public actor PrefixCacheManager: PrefixCacheOwner {
                     metaState: [layoutJSON],
                     chunkPlaintextSizes: chunks.map { $0.count },
                     createdAt: now(),
+                    expiresAt: expiresAtForWrite(),
                     scope: scopeFor(digestHex)
                 )
                 try await EncryptedKVStore.write(to: fileURL, metadata: meta, chunks: chunks, kek: kek)
@@ -804,6 +935,11 @@ public actor PrefixCacheManager: PrefixCacheOwner {
         let fm = FileManager.default
         let suffix = ".\(EncryptedKVStore.fileExtension)"
 
+        // Proactively reclaim TTL-expired entries before re-indexing, so a
+        // restart doesn't resurrect stale KV (and disk is freed even if the
+        // model is never looked up again this session).
+        reapExpired(index: index, cacheDir: cacheDir)
+
         // Drop index entries whose backing file vanished.
         for entry in index.entries(modelHash: binding.modelHash) {
             let url = modelDir.appendingPathComponent("\(entry.digestHex)\(suffix)")
@@ -834,12 +970,29 @@ public actor PrefixCacheManager: PrefixCacheOwner {
                 try? fm.removeItem(at: url)  // foreign / corrupt / mislabeled
                 continue
             }
+            // TTL: don't resurrect an orphan that's already expired. New files
+            // carry expiresAt = createdAt + ttl; LEGACY files (written before
+            // the TTL existed, or while it was disabled) have expiresAt == nil
+            // — treat those as createdAt + ttl too, so old and new files get
+            // identical semantics and a stale legacy orphan can't outlive the
+            // privacy window by being re-indexed (PR #290 review).
+            if ttlSeconds > 0 {
+                let exp = meta.expiresAt ?? saturatingExpiry(from: meta.createdAt)
+                if now() > exp {
+                    try? fm.removeItem(at: url)
+                    stats.ttlExpirations += 1
+                    continue
+                }
+            }
             let bytes = (try? fm.attributesOfItem(atPath: url.path)[.size] as? Int) ?? nil
+            // Seed lastHitAt from the file's own createdAt (NOT now()), so a
+            // re-indexed orphan keeps its real age — re-indexing can't reset the
+            // sliding TTL clock and indefinitely extend a stale entry.
             index.record(PrefixIndexEntry(
                 modelHash: binding.modelHash, digestHex: digestHex,
                 tokenCount: meta.tokenCount,
                 relativePath: "\(modelDirComponent)/\(name)",
-                fileBytes: bytes ?? 0, createdAt: meta.createdAt, lastHitAt: now()))
+                fileBytes: bytes ?? 0, createdAt: meta.createdAt, lastHitAt: meta.createdAt))
         }
         // Apply the budget to the reconciled set, then persist.
         enforceDiskBudget(index: index, cacheDir: cacheDir)
@@ -895,6 +1048,7 @@ public actor PrefixCacheManager: PrefixCacheOwner {
                 metaState: [layoutJSON],
                 chunkPlaintextSizes: chunks.map { $0.count },
                 createdAt: now(),
+                expiresAt: expiresAtForWrite(),
                 scope: scope
             )
             try await EncryptedKVStore.write(to: fileURL, metadata: meta, chunks: chunks, kek: kek)
@@ -938,6 +1092,22 @@ public actor PrefixCacheManager: PrefixCacheOwner {
     /// index.json without bound and can fill the volume. 0 budget = no cap.
     ///
     /// TB-016 sub-feature C: Uses benefit-per-byte scoring instead of LRU.
+    /// Proactively drop SSD entries past the sliding TTL (file + index entry),
+    /// independent of the disk budget. Runs at load-time reconcile so expired
+    /// KV is reclaimed even for a model that's never looked up again; the
+    /// loadFromSSD check covers steady-state. No-op when TTL is disabled or the
+    /// manager is closed (a closed manager must not mutate a handed-off dir).
+    private func reapExpired(index: PrefixCacheIndex, cacheDir: URL) {
+        guard !closed, ttlSeconds > 0 else { return }
+        for entry in index.entries(modelHash: binding.modelHash) where isExpired(lastHitAt: entry.lastHitAt) {
+            let url = cacheDir.appendingPathComponent(
+                "\(modelDirComponent)/\(entry.digestHex).\(EncryptedKVStore.fileExtension)")
+            try? FileManager.default.removeItem(at: url)
+            index.remove(modelHash: binding.modelHash, digestHex: entry.digestHex)
+            stats.ttlExpirations += 1
+        }
+    }
+
     private func enforceDiskBudget(index: PrefixCacheIndex, cacheDir: URL) {
         guard diskBudgetBytes > 0 else { return }
         var total = index.bytes(modelHash: binding.modelHash)
