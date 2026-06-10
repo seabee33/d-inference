@@ -1664,3 +1664,80 @@ func TestDetectMediaRequirementAnthropicImageBlock(t *testing.T) {
 		t.Fatal("expected Anthropic image content block to be detected as media")
 	}
 }
+
+// TestUsageChunkParseAndFinalize covers the parse-once + finalize helpers.
+func TestUsageChunkParseAndFinalize(t *testing.T) {
+	usageChunk := `data: {"object":"chat.completion.chunk","model":"gpt-oss-20b","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":50,"total_tokens":60}}`
+	pr := &registry.PendingRequest{Model: "gpt-oss-20b"}
+
+	obj, ok := parseUsageOnlyStreamChunk(usageChunk)
+	if !ok {
+		t.Fatal("expected the usage-only chunk to be detected + parsed")
+	}
+	out := finalizeUsageChunk(obj, protocol.UsageInfo{CompletionTokens: 50, ReasoningTokens: 8}, pr)
+	if !strings.Contains(out, `"reasoning_tokens":8`) {
+		t.Fatalf("expected reasoning_tokens spliced into usage; got %s", out)
+	}
+
+	// A content delta and a usage:null chunk are NOT usage-only chunks.
+	if _, ok := parseUsageOnlyStreamChunk(`data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"x"}}]}`); ok {
+		t.Fatal("a content delta must NOT be treated as a usage-only chunk")
+	}
+	if _, ok := parseUsageOnlyStreamChunk(`data: {"object":"chat.completion.chunk","choices":[],"usage":null}`); ok {
+		t.Fatal("a usage:null chunk must NOT be treated as a usage-only chunk")
+	}
+
+	// No reasoning → no completion_tokens_details added.
+	obj2, _ := parseUsageOnlyStreamChunk(usageChunk)
+	if plain := finalizeUsageChunk(obj2, protocol.UsageInfo{CompletionTokens: 50}, pr); strings.Contains(plain, "completion_tokens_details") {
+		t.Fatalf("expected no reasoning detail when ReasoningTokens=0; got %s", plain)
+	}
+
+	// Build id rewritten to the public alias.
+	obj3, _ := parseUsageOnlyStreamChunk(usageChunk)
+	prAlias := &registry.PendingRequest{Model: "gpt-oss-20b", PublicModel: "gpt-oss"}
+	aliased := finalizeUsageChunk(obj3, protocol.UsageInfo{CompletionTokens: 50, ReasoningTokens: 8}, prAlias)
+	if !strings.Contains(aliased, `"model":"gpt-oss"`) || strings.Contains(aliased, `"model":"gpt-oss-20b"`) {
+		t.Fatalf("expected build id rewritten to the public alias; got %s", aliased)
+	}
+}
+
+// TestStreamingChatReasoningTokensInUsage proves chat-completions STREAMING now
+// reports the reasoning breakdown in the terminal usage chunk (the bug: reasoning
+// was lumped into completion with no completion_tokens_details).
+func TestStreamingChatReasoningTokensInUsage(t *testing.T) {
+	logger := quietLogger()
+	srv := NewServer(registry.New(logger), store.NewMemory(store.Config{}), ServerConfig{}, logger)
+
+	pr := &registry.PendingRequest{
+		RequestID:  "job-1",
+		Model:      "gpt-oss-20b",
+		ChunkCh:    make(chan string, 8),
+		ErrorCh:    make(chan protocol.InferenceErrorMessage, 1),
+		CompleteCh: make(chan protocol.UsageInfo, 1),
+	}
+	// Provider streams a content delta, then the include_usage chunk WITHOUT a
+	// reasoning detail, then closes and reports the authoritative split via CompleteCh.
+	pr.ChunkCh <- `data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-oss-20b","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`
+	pr.ChunkCh <- `data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-oss-20b","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":50,"total_tokens":60}}`
+	close(pr.ChunkCh)
+	pr.CompleteCh <- protocol.UsageInfo{PromptTokens: 10, CompletionTokens: 50, ReasoningTokens: 8}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	rec := httptest.NewRecorder()
+	srv.handleStreamingResponseWithFirstChunk(rec, req, pr, "")
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"reasoning_tokens":8`) {
+		t.Fatalf("streaming usage missing reasoning_tokens; body=\n%s", body)
+	}
+	if !strings.Contains(body, `"completion_tokens":50`) {
+		t.Fatalf("completion_tokens should stay 50 (reasoning is a subset detail); body=\n%s", body)
+	}
+	if !strings.Contains(body, `"content":"hi"`) || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("expected the content delta and [DONE]; body=\n%s", body)
+	}
+	if strings.Count(body, `"usage":{`) != 1 {
+		t.Fatalf("expected exactly one usage chunk (held + augmented, not doubled); body=\n%s", body)
+	}
+}
