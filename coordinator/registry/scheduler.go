@@ -90,6 +90,7 @@ type routingSnapshot struct {
 	activeTokenBudgetMax  int64
 	queuedTokenBudget     int64
 	fleetMedianTPS        float64
+	hasBackendCapacity    bool // provider reports BackendCapacity; TTFT estimates are reliable
 }
 
 type routingCandidate struct {
@@ -163,6 +164,7 @@ type costBreakdown struct {
 	BacklogMs float64
 	ThisReqMs float64
 	HealthMs  float64
+	TTFTMs    float64 // estimated time-to-first-token for this candidate
 	Total     float64
 }
 
@@ -192,8 +194,18 @@ type RoutingDecision struct {
 	// precise "no vision-capable provider for this model" error instead of a
 	// generic capacity/queue signal.
 	VisionRejections int
-	EffectiveTPS     float64 // load-scaled decode TPS used in cost (Phase 4)
-	StaticTPS        float64 // benchmarked decode TPS before load scaling
+	// TTFTRejections counts providers that passed all other gates but exceeded
+	// the per-request MaxTTFTMs ceiling. Lets the caller fail fast with a 429
+	// instead of queueing or routing to a provider that misses the SLA.
+	TTFTRejections int
+	EffectiveTPS   float64 // load-scaled decode TPS used in cost (Phase 4)
+	StaticTPS      float64 // benchmarked decode TPS before load scaling
+	// BestTTFTMs is the lowest TTFT estimate seen during selection, even if it
+	// exceeded MaxTTFTMs. Used to compute an accurate Retry-After when all
+	// candidates are too slow.
+	BestTTFTMs float64
+	// TTFTMs is the estimated time-to-first-token of the selected provider.
+	TTFTMs float64
 }
 
 // ReserveProvider selects a hardware-routable provider for the request and
@@ -224,7 +236,7 @@ func (r *Registry) ReserveProviderEx(model string, pr *PendingRequest, excludeID
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	selected, candidateCount, capacityRejections, tooLargeRejections, visionRejections := r.selectBestCandidateLockedFull(model, pr, excludeIDs...)
+	selected, candidateCount, capacityRejections, tooLargeRejections, visionRejections, ttftRejections, bestTTFTMs := r.selectBestCandidateLockedFull(model, pr, excludeIDs...)
 	if selected == nil {
 		return nil, RoutingDecision{
 			Model:                   model,
@@ -232,6 +244,8 @@ func (r *Registry) ReserveProviderEx(model string, pr *PendingRequest, excludeID
 			CapacityRejections:      capacityRejections,
 			ModelTooLargeRejections: tooLargeRejections,
 			VisionRejections:        visionRejections,
+			TTFTRejections:          ttftRejections,
+			BestTTFTMs:              bestTTFTMs,
 		}
 	}
 
@@ -260,6 +274,8 @@ func (r *Registry) ReserveProviderEx(model string, pr *PendingRequest, excludeID
 			CapacityRejections:      capacityRejections,
 			ModelTooLargeRejections: tooLargeRejections,
 			VisionRejections:        visionRejections,
+			TTFTRejections:          ttftRejections,
+			BestTTFTMs:              bestTTFTMs,
 		}
 	}
 
@@ -288,6 +304,9 @@ func (r *Registry) ReserveProviderEx(model string, pr *PendingRequest, excludeID
 		CapacityRejections:      capacityRejections,
 		ModelTooLargeRejections: tooLargeRejections,
 		VisionRejections:        visionRejections,
+		TTFTRejections:          ttftRejections,
+		BestTTFTMs:              bestTTFTMs,
+		TTFTMs:                  bd.TTFTMs,
 		EffectiveTPS:            selected.effectiveTPS,
 		StaticTPS:               selected.snapshot.decodeTPS,
 	}
@@ -301,8 +320,8 @@ func (r *Registry) ReserveProviderEx(model string, pr *PendingRequest, excludeID
 // provider is over-subscribed", which is the difference between the
 // no_provider and over_capacity outcome counters.
 // Returns (winner, candidateCount, capacityRejections, modelTooLargeRejections,
-// visionRejections).
-func (r *Registry) selectBestCandidateLockedFull(model string, pr *PendingRequest, excludeIDs ...string) (*routingCandidate, int, int, int, int) {
+// visionRejections, ttftRejections, bestTTFTMs).
+func (r *Registry) selectBestCandidateLockedFull(model string, pr *PendingRequest, excludeIDs ...string) (*routingCandidate, int, int, int, int, int, float64) {
 	excludeSet := make(map[string]struct{}, len(excludeIDs))
 	for _, id := range excludeIDs {
 		excludeSet[id] = struct{}{}
@@ -323,6 +342,9 @@ func (r *Registry) selectBestCandidateLockedFull(model string, pr *PendingReques
 	capacityRejections := 0
 	tooLargeRejections := 0
 	visionRejections := 0
+	ttftRejections := 0
+	bestTTFTMs := 0.0
+	enforceTTFT := pr.MaxTTFTMs > 0
 	affinityProviderID := ""
 	affinityLookup := pr.CacheAffinityKey != "" && pr.ConsumerKey != ""
 	if affinityLookup && r.cacheAffinityBonusMs > 0 {
@@ -383,6 +405,27 @@ func (r *Registry) selectBestCandidateLockedFull(model string, pr *PendingReques
 			}
 			continue
 		}
+
+		// Track the best reliable TTFT seen among providers that passed all
+		// structural and capacity gates. Even if this candidate is over the
+		// ceiling, the value is used for Retry-After on the TTFT 429 path.
+		// Providers without BackendCapacity do not contribute a reliable TTFT
+		// estimate, so they are skipped here.
+		if snap.hasBackendCapacity && (candidate.breakdown.TTFTMs < bestTTFTMs || bestTTFTMs == 0) {
+			bestTTFTMs = candidate.breakdown.TTFTMs
+		}
+
+		// Enforce the per-request TTFT ceiling for public inference routes.
+		// Providers above the threshold are counted as TTFT rejections and
+		// excluded from cost-based selection so the router cannot pick a
+		// provider that misses the OpenRouter SLA target. Providers without
+		// BackendCapacity have no reliable TTFT estimate, so the ceiling is
+		// not enforced on them (matching the preflight behavior).
+		if enforceTTFT && snap.hasBackendCapacity && candidate.breakdown.TTFTMs > pr.MaxTTFTMs {
+			ttftRejections++
+			continue
+		}
+
 		if affinityProviderID != "" && p.ID == affinityProviderID {
 			bonus := r.cacheAffinityBonusMs
 			if bonus > candidate.costMs {
@@ -396,7 +439,7 @@ func (r *Registry) selectBestCandidateLockedFull(model string, pr *PendingReques
 	}
 
 	if len(candidates) == 0 {
-		return nil, candidateCount, capacityRejections, tooLargeRejections, visionRejections
+		return nil, candidateCount, capacityRejections, tooLargeRejections, visionRejections, ttftRejections, bestTTFTMs
 	}
 
 	// Prefer-with-fallback: if the caller asked to prefer their own machine and
@@ -482,7 +525,7 @@ func (r *Registry) selectBestCandidateLockedFull(model string, pr *PendingReques
 		}
 	}
 	r.logRoutingDecision(model, pr, winner, candidateCount)
-	return winner, candidateCount, capacityRejections, tooLargeRejections, visionRejections
+	return winner, candidateCount, capacityRejections, tooLargeRejections, visionRejections, ttftRejections, bestTTFTMs
 }
 
 func providerMatchesAllowedSerial(p *Provider, allowed map[string]struct{}) bool {
@@ -713,6 +756,7 @@ func (r *Registry) snapshotProviderLocked(p *Provider, model string, traits Requ
 		snap.pendingMaxTokens += pendingTokenBudget(pr)
 	}
 	snap.hasHeadroom = p.hasConcurrencyHeadroomForModelLocked(model)
+	snap.hasBackendCapacity = p.BackendCapacity != nil
 
 	if p.BackendCapacity != nil {
 		snap.gpuMemoryActiveGB = p.BackendCapacity.GPUMemoryActiveGB
@@ -898,6 +942,16 @@ func (r *Registry) buildCandidateWithReason(snap routingSnapshot, pr *PendingReq
 	healthMs := healthPenaltyMs(snap.systemMetrics, snap.gpuMemoryActiveGB, snap.totalMemoryGB)
 	cost := statePenalty + queueMs + pendingMs + backlogMs + thisReqMs + healthMs
 
+	// Estimated time-to-first-token for this candidate. Used for the
+	// OpenRouter TTFT ceiling: public routes only select providers whose
+	// estimated TTFT is within the per-request threshold. Providers without
+	// BackendCapacity get 0 (unreliable estimate) and are not rejected by the
+	// ceiling, matching the preflight behavior.
+	ttftMs := ttftMsFromSnapshot(snap, reqPrompt, reqMax)
+	if ttftMs <= 0 || math.IsNaN(ttftMs) || math.IsInf(ttftMs, 0) {
+		ttftMs = 0
+	}
+
 	return &routingCandidate{
 		provider:       snap.provider,
 		snapshot:       snap,
@@ -911,6 +965,7 @@ func (r *Registry) buildCandidateWithReason(snap routingSnapshot, pr *PendingReq
 			BacklogMs: backlogMs,
 			ThisReqMs: thisReqMs,
 			HealthMs:  healthMs,
+			TTFTMs:    ttftMs,
 			Total:     cost,
 		},
 	}, rejectNone, true
@@ -1104,14 +1159,20 @@ func (r *Registry) providerCanAdmitLocked(p *Provider, model string, traits Requ
 //     a model that will never fit (the client would retry forever) — it should
 //     surface model_too_large / 503 instead.
 func (r *Registry) QuickCapacityCheck(model string, estimatedPromptTokens, requestedMaxTokens int, traits RequestTraits, allowedSerials ...string) (candidateCount, capacityRejections, modelTooLarge int) {
-	return r.quickCapacityCheck(model, estimatedPromptTokens, requestedMaxTokens, traits, false, allowedSerials...)
+	candidateCount, capacityRejections, modelTooLarge, _, _ = r.quickCapacityCheck(model, estimatedPromptTokens, requestedMaxTokens, traits, false, allowedSerials...)
+	return candidateCount, capacityRejections, modelTooLarge
 }
 
 func (r *Registry) QuickCapacityCheckForRequest(model string, estimatedPromptTokens, requestedMaxTokens int, traits RequestTraits, requiresVision bool, allowedSerials ...string) (candidateCount, capacityRejections, modelTooLarge int) {
+	candidateCount, capacityRejections, modelTooLarge, _, _ = r.quickCapacityCheck(model, estimatedPromptTokens, requestedMaxTokens, traits, requiresVision, allowedSerials...)
+	return candidateCount, capacityRejections, modelTooLarge
+}
+
+func (r *Registry) QuickCapacityCheckWithTTFTForRequest(model string, estimatedPromptTokens, requestedMaxTokens int, traits RequestTraits, requiresVision bool, allowedSerials ...string) (candidateCount, capacityRejections, modelTooLarge int, bestTTFT time.Duration, hasTTFT bool) {
 	return r.quickCapacityCheck(model, estimatedPromptTokens, requestedMaxTokens, traits, requiresVision, allowedSerials...)
 }
 
-func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, requestedMaxTokens int, traits RequestTraits, requiresVision bool, allowedSerials ...string) (candidateCount, capacityRejections, modelTooLarge int) {
+func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, requestedMaxTokens int, traits RequestTraits, requiresVision bool, allowedSerials ...string) (candidateCount, capacityRejections, modelTooLarge int, bestTTFT time.Duration, hasTTFT bool) {
 	// Use a dummy PendingRequest with the caller's actual token estimates
 	// for the admission gate (freeMemoryAdmits).
 	if estimatedPromptTokens <= 0 {
@@ -1136,6 +1197,7 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	unknownTTFTCandidate := false
 	now := time.Now()
 	for _, p := range r.providers {
 		// Filter by allowed serials before acquiring the provider lock
@@ -1172,13 +1234,17 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 
 		// Build a snapshot for the admission gate (slot state + free memory).
 		snap := routingSnapshot{
-			provider:      p,
-			model:         model,
-			slotState:     "unknown",
-			totalPending:  p.pendingCount(),
-			totalMemoryGB: float64(p.Hardware.MemoryGB),
-			modelSizeGB:   r.catalogSizeGBLocked(model),
-			minRAMGb:      r.catalogMinRAMGbLocked(model),
+			provider:           p,
+			model:              model,
+			slotState:          "unknown",
+			totalPending:       p.pendingCount(),
+			systemMetrics:      p.SystemMetrics,
+			decodeTPS:          resolvedDecodeTPS(p),
+			prefillTPS:         resolvedPrefillTPS(p),
+			totalMemoryGB:      float64(p.Hardware.MemoryGB),
+			modelSizeGB:        r.catalogSizeGBLocked(model),
+			minRAMGb:           r.catalogMinRAMGbLocked(model),
+			hasBackendCapacity: p.BackendCapacity != nil,
 		}
 		for _, pending := range p.pendingReqs {
 			if pending.Model != model {
@@ -1187,7 +1253,7 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 			snap.pendingForModel++
 			snap.pendingMaxTokens += pendingTokenBudget(pending)
 		}
-		if p.BackendCapacity != nil {
+		if snap.hasBackendCapacity {
 			snap.gpuMemoryActiveGB = p.BackendCapacity.GPUMemoryActiveGB
 			if p.BackendCapacity.TotalMemoryGB > 0 {
 				snap.totalMemoryGB = p.BackendCapacity.TotalMemoryGB
@@ -1197,6 +1263,9 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 					continue
 				}
 				snap.slotState = slot.State
+				snap.backendRunning = int(slot.NumRunning)
+				snap.backendWaiting = int(slot.NumWaiting)
+				snap.observedDecodeTPS = slot.ObservedDecodeTPS
 				snap.activeTokenBudgetUsed = slot.ActiveTokenBudgetUsed
 				snap.activeTokenBudgetMax = slot.ActiveTokenBudgetMax
 				snap.queuedTokenBudget = slot.QueuedTokenBudget
@@ -1206,6 +1275,7 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 		}
 		snap.modelLoaded = slotStateModelLoaded(snap.slotState)
 		snap.availableOnDisk = !snap.modelLoaded
+		snap.fleetMedianTPS = r.tpsRegistry.Median(model, p.Hardware.ChipFamily)
 
 		p.mu.Unlock()
 
@@ -1231,8 +1301,77 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 		}
 
 		candidateCount++
+		if snap.hasBackendCapacity {
+			ttft := estimatedTTFTFromSnapshot(snap, estimatedPromptTokens, requestedMaxTokens)
+			if !hasTTFT || ttft < bestTTFT {
+				bestTTFT = ttft
+				hasTTFT = true
+			}
+		} else {
+			unknownTTFTCandidate = true
+		}
 	}
-	return candidateCount, capacityRejections, modelTooLarge
+	if unknownTTFTCandidate {
+		return candidateCount, capacityRejections, modelTooLarge, 0, false
+	}
+	return candidateCount, capacityRejections, modelTooLarge, bestTTFT, hasTTFT
+}
+
+func estimatedTTFTFromSnapshot(snap routingSnapshot, reqPromptTokens, reqMaxTokens int) time.Duration {
+	ttftMs := ttftMsFromSnapshot(snap, reqPromptTokens, reqMaxTokens)
+	if ttftMs <= 0 || math.IsNaN(ttftMs) || math.IsInf(ttftMs, 0) {
+		return 0
+	}
+	return time.Duration(ttftMs * float64(time.Millisecond))
+}
+
+// ttftMsFromSnapshot returns the estimated time-to-first-token in milliseconds
+// for a candidate/provider snapshot. It is shared between the preflight
+// (QuickCapacityCheckWithTTFTForRequest) and the scheduler
+// (buildCandidateWithReason) so the two paths cannot drift on what "TTFT"
+// means.
+func ttftMsFromSnapshot(snap routingSnapshot, reqPromptTokens, reqMaxTokens int) float64 {
+	if !snap.hasBackendCapacity {
+		return 0
+	}
+	statePenalty, _ := slotStatePenalty(snap.slotState)
+	if reqPromptTokens < 0 {
+		reqPromptTokens = 0
+	}
+	if reqMaxTokens <= 0 {
+		reqMaxTokens = defaultRequestedMaxTokens
+	}
+	prefillTPS := snap.prefillTPS
+	if prefillTPS <= 0 {
+		prefillTPS = 1.0
+	}
+	effectiveTPS := resolveEffectiveTPS(snap)
+	if effectiveTPS <= 0 {
+		effectiveTPS = 1.0
+	}
+
+	var backlogMs float64
+	if snap.activeTokenBudgetMax > 0 {
+		tokensAhead := float64(snap.activeTokenBudgetUsed) + float64(snap.queuedTokenBudget)
+		coordinatorExtra := float64(snap.pendingMaxTokens) - float64(committedTokenBudget(snap))
+		if coordinatorExtra > 0 {
+			tokensAhead += coordinatorExtra
+		}
+		backlogMs = tokensAhead / effectiveTPS * 1000.0
+	} else {
+		runningBacklogTokens := float64(snap.maxTokensPotential)
+		if runningBacklogTokens <= 0 && snap.backendRunning > 0 {
+			runningBacklogTokens = float64(snap.backendRunning * reqMaxTokens)
+		}
+		waitingBacklogTokens := float64(snap.backendWaiting * reqMaxTokens)
+		unaccountedPendingTokens := float64(snap.pendingMaxTokens) - runningBacklogTokens - waitingBacklogTokens
+		if unaccountedPendingTokens < 0 {
+			unaccountedPendingTokens = 0
+		}
+		backlogMs = (runningBacklogTokens + waitingBacklogTokens + unaccountedPendingTokens) / effectiveTPS * 1000.0
+	}
+
+	return statePenalty + backlogMs + float64(reqPromptTokens)/prefillTPS*1000.0
 }
 
 // DrainQueuedRequestsForModel attempts to assign queued requests for a
