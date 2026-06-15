@@ -31,5 +31,8 @@ public enum ProviderCore {
     // propagated into every row -> token-salad/repetition under concurrent load.
     // Fixed in mlx-swift-lm#38 (gemma4AttentionFallback NaN-guard); submodule
     // pin advanced to ee2a921.
-    public static let version = "0.6.9"
+    // 0.6.10 ships the resource-count-safe MLX allocator pins, bounded model
+    // weight hashing, attestation reconnect stability, alias-aware catalog UX,
+    // and coordinator-side TTFT 429 admission for overloaded OpenRouter traffic.
+    public static let version = "0.6.10"
 }
