@@ -27,10 +27,12 @@ import {
 } from "lucide-react";
 import { TopBar } from "@/components/TopBar";
 import {
-  catalogModelsFromResponse,
+  catalogDataFromResponse,
   capacityModelsFromResponse,
   filterServedCatalogModels,
   type CapacityModelSummary,
+  type CatalogAliasSummary,
+  type CatalogDataSummary,
   type CatalogModelSummary,
 } from "@/lib/stats-model-filter";
 import {
@@ -295,18 +297,18 @@ function normalizeTimeSeries(data: TimeSeriesBucket[], minutes = 30): TimeSeries
   });
 }
 
-async function fetchModelCatalog(): Promise<CatalogModelSummary[] | null> {
+async function fetchModelCatalog(): Promise<CatalogDataSummary | null> {
   const urls = [
     "/api/models",
-    `${COORDINATOR_URL}/v1/models/catalog?type=text`,
+    `${COORDINATOR_URL}/v1/models/catalog?type=text&include_aliases=1`,
   ];
 
   for (const url of urls) {
     try {
       const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) continue;
-      const catalog = catalogModelsFromResponse(await res.json());
-      if (catalog.length > 0) return catalog;
+      const catalog = catalogDataFromResponse(await res.json());
+      if (catalog.models.length > 0) return catalog;
     } catch {
       // Keep stats usable if catalog lookup fails.
     }
@@ -464,14 +466,6 @@ function MiniStat({
 // ---------------------------------------------------------------------------
 // Network Power -- realistic Apple Silicon draw, auto-scaled units
 // ---------------------------------------------------------------------------
-function modelProviders(modelID: string, providers: ProviderStats[]): ProviderStats[] {
-  if (modelID === GEMMA_PUBLIC_ID) return gemmaRolloutProviders(providers);
-  return providers.filter((provider) => {
-    if (provider.current_model === modelID) return true;
-    return provider.models?.includes(modelID) ?? false;
-  });
-}
-
 function providerServesGemmaRollout(provider: ProviderStats): boolean {
   if (provider.current_model && GEMMA_ROLLOUT_IDS.has(provider.current_model)) return true;
   return provider.models?.some((model) => GEMMA_ROLLOUT_IDS.has(model)) ?? false;
@@ -481,22 +475,146 @@ function gemmaRolloutProviders(providers: ProviderStats[]): ProviderStats[] {
   return providers.filter(providerServesGemmaRollout);
 }
 
+function modelProviders(modelID: string, providers: ProviderStats[], providersByModel: Map<string, ProviderStats[]>): ProviderStats[] {
+  if (modelID === GEMMA_PUBLIC_ID) return gemmaRolloutProviders(providers);
+  return providersByModel.get(modelID) ?? [];
+}
+
+function aliasMemberBuilds(alias: CatalogAliasSummary, includeRetired = true): string[] {
+  const builds = new Set<string>();
+  builds.add(alias.desiredBuild);
+  if (alias.previousBuild) builds.add(alias.previousBuild);
+  if (includeRetired) {
+    for (const retired of alias.retiredBuilds ?? []) builds.add(retired);
+  }
+  return [...builds];
+}
+
+function hiddenAliasBuilds(aliases: CatalogAliasSummary[]): Set<string> {
+  const hidden = new Set<string>();
+  for (const alias of aliases) {
+    for (const build of aliasMemberBuilds(alias)) hidden.add(build);
+  }
+  return hidden;
+}
+
+function buildProvidersByModel(providers: ProviderStats[]): Map<string, ProviderStats[]> {
+  const byModel = new Map<string, ProviderStats[]>();
+  for (const provider of providers) {
+    const ids = new Set(provider.models ?? []);
+    if (provider.current_model) ids.add(provider.current_model);
+    for (const id of ids) {
+      const bucket = byModel.get(id);
+      if (bucket) {
+        bucket.push(provider);
+      } else {
+        byModel.set(id, [provider]);
+      }
+    }
+  }
+  return byModel;
+}
+
+function modelProvidersForBuilds(buildIDs: string[], providersByModel: Map<string, ProviderStats[]>): ProviderStats[] {
+  const seen = new Set<string>();
+  const providers: ProviderStats[] = [];
+  for (const build of buildIDs) {
+    for (const provider of providersByModel.get(build) ?? []) {
+      if (seen.has(provider.id)) continue;
+      seen.add(provider.id);
+      providers.push(provider);
+    }
+  }
+  return providers;
+}
+
+function publicCatalogModels(catalogModels: CatalogModelSummary[], aliases: CatalogAliasSummary[]): CatalogModelSummary[] {
+  const rawByID = new Map(catalogModels.map((model) => [model.id, model]));
+  const hidden = hiddenAliasBuilds(aliases);
+  const aliasModels: CatalogModelSummary[] = [];
+  for (const alias of aliases) {
+    const primary = rawByID.get(alias.id) ??
+      rawByID.get(alias.primaryBuild ?? alias.desiredBuild) ??
+      (alias.previousBuild ? rawByID.get(alias.previousBuild) : undefined);
+    if (!primary) continue;
+    aliasModels.push({
+      ...primary,
+      id: alias.id,
+      displayName: alias.displayName ?? primary.displayName,
+      name: alias.displayName ?? primary.name,
+      quantization: undefined,
+    });
+  }
+  const visibleRaw = catalogModels.filter((model) => !hidden.has(model.id));
+  return [...aliasModels, ...visibleRaw];
+}
+
+function aggregateCapacityForBuilds(alias: CatalogAliasSummary, capacityByID: Map<string, CapacityModelSummary>): CapacityModelSummary | null {
+  const members = aliasMemberBuilds(alias, false)
+    .map((build) => capacityByID.get(build))
+    .filter((capacity): capacity is CapacityModelSummary => Boolean(capacity));
+  if (members.length === 0) return null;
+  const sum = (pick: (capacity: CapacityModelSummary) => number | undefined) =>
+    members.reduce((total, capacity) => total + (pick(capacity) ?? 0), 0);
+  const ttfts = members
+    .map((capacity) => capacity.estimatedTTFTMS)
+    .filter((value): value is number => value !== undefined && value > 0);
+  return {
+    id: alias.id,
+    ready: members.some((capacity) => capacity.ready),
+    canAccept: members.some((capacity) => capacity.canAccept),
+    routableProviders: sum((capacity) => capacity.routableProviders),
+    warmProviders: sum((capacity) => capacity.warmProviders),
+    coldProviders: sum((capacity) => capacity.coldProviders),
+    activeRequests: sum((capacity) => capacity.activeRequests),
+    queuedRequests: sum((capacity) => capacity.queuedRequests),
+    queueLimit: Math.max(...members.map((capacity) => capacity.queueLimit ?? 0)),
+    aggregateTPS: sum((capacity) => capacity.aggregateTPS),
+    estimatedTTFTMS: ttfts.length > 0 ? Math.min(...ttfts) : undefined,
+    tokenBudgetRemaining: sum((capacity) => capacity.tokenBudgetRemaining),
+    tokenBudgetTotal: sum((capacity) => capacity.tokenBudgetTotal),
+  };
+}
+
+function publicCapacityModels(capacityModels: CapacityModelSummary[] | null, aliases: CatalogAliasSummary[]): CapacityModelSummary[] | null {
+  if (!capacityModels) return null;
+  const hidden = hiddenAliasBuilds(aliases);
+  const byID = new Map(capacityModels.map((capacity) => [capacity.id, capacity]));
+  const visible = capacityModels.filter((capacity) => !hidden.has(capacity.id));
+  for (const alias of aliases) {
+    const aggregate = aggregateCapacityForBuilds(alias, byID);
+    if (aggregate) visible.push(aggregate);
+  }
+  return visible;
+}
+
 function publicModelStats(stats: PlatformStats): ModelStats[] {
-  // Temporary Gemma 4 rollout shim. Remove after the coordinator alias catalog
-  // contract is deployed and the console consumes alias metadata.
+  // Temporary Gemma 4 rollout fallback for deployments without alias metadata.
   const raw = stats.models.filter((model) => !GEMMA_ROLLOUT_IDS.has(model.id));
   const hasGemma = stats.models.some((model) => GEMMA_ROLLOUT_IDS.has(model.id));
   if (!hasGemma) return raw;
   return [{ id: GEMMA_PUBLIC_ID, providers: gemmaRolloutProviders(stats.providers).length }, ...raw];
 }
 
-function buildModelInventory(stats: PlatformStats): ModelInventory[] {
-  const models = publicModelStats(stats);
+function buildModelInventory(stats: PlatformStats, aliases: CatalogAliasSummary[] = []): ModelInventory[] {
+  const providersByModel = buildProvidersByModel(stats.providers);
+  const aliasByID = new Map(aliases.map((alias) => [alias.id, alias]));
+  const hidden = hiddenAliasBuilds(aliases);
+  const rawModels = stats.models.filter((model) => !hidden.has(model.id));
+  const aliasModels: ModelStats[] = [];
+  for (const alias of aliases) {
+    const providers = modelProvidersForBuilds(aliasMemberBuilds(alias, false), providersByModel);
+    if (providers.length > 0) aliasModels.push({ id: alias.id, providers: providers.length });
+  }
+  const models = aliases.length > 0 ? [...rawModels, ...aliasModels] : publicModelStats(stats);
   const totalSlots = models.reduce((sum, model) => sum + model.providers, 0);
 
   return models
     .map((model) => {
-      const providers = modelProviders(model.id, stats.providers);
+      const alias = aliasByID.get(model.id);
+      const providers = alias
+        ? modelProvidersForBuilds(aliasMemberBuilds(alias, false), providersByModel)
+        : modelProviders(model.id, stats.providers, providersByModel);
       return {
         model,
         providers,
@@ -712,68 +830,22 @@ function ModelHeaderMetric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function publicCatalogModels(catalogModels: CatalogModelSummary[] | null): CatalogModelSummary[] | null {
-  if (!catalogModels) return null;
-  const gemma = catalogModels.find((model) => model.id === GEMMA_PUBLIC_ID) ??
-    catalogModels.find((model) => model.id === GEMMA_QAT_ID);
-  const visible = catalogModels.filter((model) => !GEMMA_ROLLOUT_IDS.has(model.id));
-  if (!gemma) return visible;
-  return [{
-    ...gemma,
-    id: GEMMA_PUBLIC_ID,
-    displayName: "Gemma 4 26B",
-    name: "Gemma 4 26B",
-    quantization: undefined,
-  }, ...visible];
-}
-
-function aggregateGemmaCapacity(capacityModels: CapacityModelSummary[]): CapacityModelSummary | null {
-  const members = capacityModels.filter((model) => GEMMA_ROLLOUT_IDS.has(model.id));
-  if (members.length === 0) return null;
-  const sum = (pick: (capacity: CapacityModelSummary) => number | undefined) =>
-    members.reduce((total, capacity) => total + (pick(capacity) ?? 0), 0);
-  const ttfts = members
-    .map((capacity) => capacity.estimatedTTFTMS)
-    .filter((value): value is number => value !== undefined && value > 0);
-  return {
-    id: GEMMA_PUBLIC_ID,
-    ready: members.some((capacity) => capacity.ready),
-    canAccept: members.some((capacity) => capacity.canAccept),
-    routableProviders: sum((capacity) => capacity.routableProviders),
-    warmProviders: sum((capacity) => capacity.warmProviders),
-    coldProviders: sum((capacity) => capacity.coldProviders),
-    activeRequests: sum((capacity) => capacity.activeRequests),
-    queuedRequests: sum((capacity) => capacity.queuedRequests),
-    queueLimit: Math.max(...members.map((capacity) => capacity.queueLimit ?? 0)),
-    aggregateTPS: sum((capacity) => capacity.aggregateTPS),
-    estimatedTTFTMS: ttfts.length > 0 ? Math.min(...ttfts) : undefined,
-    tokenBudgetRemaining: sum((capacity) => capacity.tokenBudgetRemaining),
-    tokenBudgetTotal: sum((capacity) => capacity.tokenBudgetTotal),
-  };
-}
-
-function publicCapacityModels(capacityModels: CapacityModelSummary[] | null): CapacityModelSummary[] | null {
-  if (!capacityModels) return null;
-  const visible = capacityModels.filter((model) => !GEMMA_ROLLOUT_IDS.has(model.id));
-  const gemma = aggregateGemmaCapacity(capacityModels);
-  return gemma ? [gemma, ...visible] : visible;
-}
-
 function ActiveModelsSection({
   stats,
-  catalogModels,
+  catalogData,
   capacityModels,
 }: {
   stats: PlatformStats;
-  catalogModels: CatalogModelSummary[] | null;
+  catalogData: CatalogDataSummary | null;
   capacityModels: CapacityModelSummary[] | null;
 }) {
   const [showDeprecatedModels, setShowDeprecatedModels] = useState(false);
-  const visibleCatalogModels = publicCatalogModels(catalogModels);
-  const visibleCapacityModels = publicCapacityModels(capacityModels);
-  const inventory = buildModelInventory(stats);
-  const catalogByID = new Map((visibleCatalogModels ?? []).map((model) => [model.id, model]));
-  const capacityByID = new Map((visibleCapacityModels ?? []).map((model) => [model.id, model]));
+  const aliases = catalogData?.aliases ?? [];
+  const catalogModels = catalogData ? publicCatalogModels(catalogData.models, aliases) : null;
+  const publicCapacity = publicCapacityModels(capacityModels, aliases);
+  const inventory = buildModelInventory(stats, aliases);
+  const catalogByID = new Map((catalogModels ?? []).map((model) => [model.id, model]));
+  const capacityByID = new Map((publicCapacity ?? []).map((model) => [model.id, model]));
   const servedInventory = inventory.map((item) => ({
     ...item,
     id: item.model.id,
@@ -781,8 +853,8 @@ function ActiveModelsSection({
     catalogModel: catalogByID.get(item.model.id),
     capacity: capacityByID.get(item.model.id),
   }));
-  const filtered = visibleCatalogModels
-    ? filterServedCatalogModels(servedInventory, visibleCatalogModels, showDeprecatedModels)
+  const filtered = catalogModels
+    ? filterServedCatalogModels(servedInventory, catalogModels, showDeprecatedModels)
     : {
       visible: servedInventory.map((item) => ({ ...item, catalogStatus: "active" })),
       catalogServedCount: servedInventory.length,
@@ -2873,7 +2945,7 @@ function NetworkNodes({ providers }: { providers: ProviderStats[] }) {
 // ---------------------------------------------------------------------------
 export default function StatsPage() {
   const [stats, setStats] = useState<PlatformStats | null>(null);
-  const [catalogModels, setCatalogModels] = useState<CatalogModelSummary[] | null>(null);
+  const [catalogData, setCatalogData] = useState<CatalogDataSummary | null>(null);
   const [capacityModels, setCapacityModels] = useState<CapacityModelSummary[] | null>(null);
   const [activeTab, setActiveTab] = useState<StatsTab>("overview");
   const [loading, setLoading] = useState(true);
@@ -2891,7 +2963,7 @@ export default function StatsPage() {
       const data = await res.json();
       setStats(data);
       if (catalog) {
-        setCatalogModels(catalog);
+        setCatalogData(catalog);
       }
       if (capacity) {
         setCapacityModels(capacity);
@@ -2939,6 +3011,7 @@ export default function StatsPage() {
   }
 
   const hardwareAttested = stats.providers.filter((p) => p.trust_level === "hardware").length;
+  const visibleModelCount = buildModelInventory(stats, catalogData?.aliases ?? []).length;
   const networkPowerWatts = activeNetworkPowerWatts(stats);
   const tabs: Array<{ value: StatsTab; label: string }> = [
     { value: "overview", label: "Overview" },
@@ -3037,7 +3110,7 @@ export default function StatsPage() {
           />
           <MiniStat
             label="Models"
-            value={publicModelStats(stats).length.toString()}
+            value={visibleModelCount.toString()}
             sub="serving now"
           />
         </div>
@@ -3093,7 +3166,7 @@ export default function StatsPage() {
         {stats.models.length > 0 && (
           <ActiveModelsSection
             stats={stats}
-            catalogModels={catalogModels}
+            catalogData={catalogData}
             capacityModels={capacityModels}
           />
         )}

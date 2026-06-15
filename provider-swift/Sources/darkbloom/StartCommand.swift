@@ -587,9 +587,55 @@ struct Start: AsyncParsableCommand {
         let downloaded: Bool
     }
 
+    private struct PickerCatalogRow {
+        let model: CatalogModel
+        let displayName: String
+    }
+
     private static let gemmaPublicID = "gemma-4-26b"
     private static let gemmaQATID = "gemma-4-26b-qat-4bit"
     private static let gemmaRollbackID = "gemma-4-26b-8bit"
+
+    private func pickerCatalogRows(models: [CatalogModel], aliases: [CatalogAlias]) -> [PickerCatalogRow] {
+        if aliases.isEmpty {
+            let gemmaQATAvailable = models.contains { $0.id == Self.gemmaQATID }
+            return models.compactMap { model in
+                if shouldHideGemmaRolloutModel(model, qatAvailable: gemmaQATAvailable) || isHiddenPickerModel(model) {
+                    return nil
+                }
+                return PickerCatalogRow(model: model, displayName: gemmaRolloutDisplayName(for: model) ?? model.displayName)
+            }
+        }
+
+        var hiddenBuilds = Set<String>()
+        var aliasDisplayByBuild: [String: String] = [:]
+        for alias in aliases {
+            hiddenBuilds.insert(alias.desiredBuild)
+            if let previous = alias.previousBuild { hiddenBuilds.insert(previous) }
+            for retired in alias.retiredBuilds ?? [] { hiddenBuilds.insert(retired) }
+
+            let primary = alias.primaryBuild ?? alias.desiredBuild
+            aliasDisplayByBuild[primary] = alias.displayName
+        }
+
+        return models.compactMap { model in
+            if let displayName = aliasDisplayByBuild[model.id] {
+                return PickerCatalogRow(model: model, displayName: displayName)
+            }
+            if hiddenBuilds.contains(model.id) || isHiddenPickerModel(model) {
+                return nil
+            }
+            return PickerCatalogRow(model: model, displayName: model.displayName)
+        }
+    }
+
+    private func isHiddenPickerModel(_ model: CatalogModel) -> Bool {
+        if let metadata = model.metadata {
+            if metadata["hidden_from_picker"] == .bool(true) { return true }
+            if metadata["hide_standalone"] == .bool(true) { return true }
+        }
+        return model.displayName.localizedCaseInsensitiveContains("rollback")
+    }
 
     private func gemmaRolloutDisplayName(for model: CatalogModel) -> String? {
         // Temporary Gemma 4 rollout shim. Remove after the coordinator alias
@@ -612,14 +658,16 @@ struct Start: AsyncParsableCommand {
     ) async throws -> [String] {
         let client = ModelCatalogClient(coordinatorURL: coordinatorURL)
 
-        let catalog: [CatalogModel]
+        let catalogSnapshot: CatalogSnapshot
         do {
-            catalog = try await client.fetchCatalog(typeFilter: "text")
+            catalogSnapshot = try await client.fetchCatalogSnapshot(typeFilter: "text", includeAliases: true)
         } catch {
             printError("Could not fetch model catalog from coordinator: \(error)")
             printError("hint: check your coordinator URL or use --model to specify models directly")
             throw ExitCode.failure
         }
+
+        let catalog = pickerCatalogRows(models: catalogSnapshot.models, aliases: catalogSnapshot.aliases)
 
         guard !catalog.isEmpty else {
             printError("No models in the coordinator catalog.")
@@ -628,14 +676,11 @@ struct Start: AsyncParsableCommand {
 
         let localByID = Dictionary(uniqueKeysWithValues: snapshot.models.map { ($0.id, $0) })
         let memoryGb: Double = Double(snapshot.hardware?.memoryGb ?? 16)
-        let gemmaQATAvailable = catalog.contains { $0.id == Self.gemmaQATID }
 
         // Build picker entries: filter to models that fit, sort downloaded-first
         // then by size descending.
-        var entries: [PickerEntry] = catalog.compactMap { entry in
-            if shouldHideGemmaRolloutModel(entry, qatAvailable: gemmaQATAvailable) {
-                return nil
-            }
+        var entries: [PickerEntry] = catalog.compactMap { row -> PickerEntry? in
+            let entry = row.model
             if let minRam = entry.minRamGb, Double(minRam) > memoryGb {
                 return nil
             }
@@ -649,7 +694,7 @@ struct Start: AsyncParsableCommand {
             return PickerEntry(
                 id: entry.id,
                 catalogModel: entry,
-                displayName: gemmaRolloutDisplayName(for: entry) ?? entry.displayName,
+                displayName: row.displayName,
                 sizeGb: size,
                 minRamGb: entry.minRamGb,
                 downloaded: isDownloaded
