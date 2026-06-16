@@ -1485,12 +1485,16 @@ public actor BatchScheduler {
             architecture: snapshot.architecture,
             weightBytes: snapshot.bytes
         )
-        let totalMemory = Int(ProcessInfo.processInfo.physicalMemory)
-        let osReserve = 4 * 1024 * 1024 * 1024
-        let safetyMargin = totalMemory / 10
-        let availableForKV = totalMemory - snapshot.bytes - osReserve - safetyMargin
+        // Static upper-bound budget from the unified 90% cap minus THIS model's
+        // measured resident weights (snapshot.bytes) and the activation reserve.
+        // Only the per-model clamp; cross-model headroom (other resident models'
+        // weights/KV) is handled live by tokenBudgetMax / the shared
+        // GlobalKVCacheBudget, which read process-global MLX usage.
+        let availableForKV = UnifiedMemoryCap.kvBudgetBytes(
+            residentWeightBytes: UInt64(max(0, snapshot.bytes)))
         if availableForKV > 0 && kvBytesPerToken > 0 {
-            self.dynamicTokenBudgetMax = max(availableForKV / kvBytesPerToken, 1024)
+            let availInt = Int(min(availableForKV, UInt64(Int.max)))
+            self.dynamicTokenBudgetMax = max(availInt / kvBytesPerToken, 1024)
         } else {
             self.dynamicTokenBudgetMax = 1024
         }
@@ -1512,6 +1516,64 @@ public actor BatchScheduler {
 
     public func unloadModel() async {
         await stopCurrentEngine()
+    }
+
+    /// Reserve unified memory for a VLM (vision-path) request against the shared
+    /// 90% cap, via the process-wide GlobalKVCacheBudget this scheduler holds. A
+    /// vision request bypasses the batched `submitTokenized` reservation entirely
+    /// — it streams through `container.generate` directly — so without this it
+    /// commits TWO kinds of memory the cap would otherwise track only reactively:
+    ///
+    /// 1. `mediaDecodeBytes` — the transient CIImage rasters + Swift `Data` pixel
+    ///    buffers from media decode. These are NOT MLXArrays, so they are
+    ///    invisible to the cap's live MLX counters (the original blind spot).
+    /// 2. The generation KV cache — `kvBytesPerToken × maxOutputTokens`. This IS
+    ///    MLXArray-backed (eventually visible to the live counters), but the
+    ///    vision path's decode loop runs in a detached task with no per-request
+    ///    reservation, so N concurrent media requests can grow KV simultaneously
+    ///    against headroom none of them reserved — a transient over-commit the
+    ///    cap would otherwise catch only on the NEXT admission. Reserving it up
+    ///    front makes the vision path share the same preemptive 90% gate the
+    ///    batched path gets from `reserveKVForRequest`.
+    ///
+    /// Both are charged to ONE reservation id and released together when the
+    /// stream ends (decode buffers are actually freed after `prepare`, so holding
+    /// them for the whole stream is conservative — never an under-reservation).
+    /// Returns true if it fits (and was reserved) or budgeting is disabled
+    /// (nil budget, legacy "always proceed"); false if it would exceed the cap,
+    /// in which case the caller surfaces a retryable 503. Pair with
+    /// `releaseVisionRequest`. Saturating; never traps.
+    public func reserveVisionRequest(
+        requestId: String, mediaDecodeBytes: UInt64, kvTokens: Int
+    ) async -> Bool {
+        guard let kvBudget else { return true }
+        // KV bytes = kvBytesPerToken × the FULL token span the cache will hold:
+        // prompt text + image/video soft tokens + generated output (the caller
+        // computes that conservative total). Reserving only the output tokens
+        // would badly under-count — a single image expands to hundreds of vision
+        // tokens, all of which occupy KV.
+        var genKVBytes: UInt64 = 0
+        if kvBytesPerToken > 0, kvTokens > 0 {
+            let (b, overflow) = UInt64(kvBytesPerToken)
+                .multipliedReportingOverflow(by: UInt64(kvTokens))
+            genKVBytes = overflow ? .max : b
+        }
+        let (total, overflow) = mediaDecodeBytes.addingReportingOverflow(genKVBytes)
+        let bytes = overflow ? UInt64.max : total
+        return await kvBudget.reserveBytes(requestID: requestId, bytes: bytes)
+    }
+
+    /// The model's configured context window (`max_position_embeddings`), or 0 if
+    /// unknown. The KV cache can never hold more than this many prompt+vision
+    /// tokens, so the vision-path reservation clamps its prompt+vision estimate to
+    /// it (output tokens are added on top, matching the batched path's
+    /// `promptTokenCount + maxTokens`).
+    public func contextLength() -> Int { maxContextLength }
+
+    /// Release a prior `reserveVisionRequest` reservation. Safe/no-op if unknown
+    /// or budgeting is disabled.
+    public func releaseVisionRequest(requestId: String) async {
+        await kvBudget?.release(requestID: requestId)
     }
 
     // MARK: - Submit / cancel
@@ -1944,19 +2006,19 @@ public actor BatchScheduler {
         self.engine = nil
         modelContainer = nil
         tokenizer = nil
-        // Drain the bounded capture pipeline: the engine is stopped (no more
-        // capture hooks fire), so finish the stream and cancel the consumer.
-        // This releases any retained KV snapshots and stops an in-flight
-        // `mgr.store` from racing the index flush / accountant deregister below,
-        // and guarantees no snapshot (or consumer Task) leaks across a swap.
+        // Drain the bounded capture pipeline FIRST (#374): the engine is stopped
+        // (no more capture hooks fire), so finish the stream and cancel the
+        // consumer. This releases retained KV snapshots and stops an in-flight
+        // `mgr.store` from racing the purge below.
         capturePipeline?.shutdown()
         capturePipeline = nil
-        // Persist any coalesced index writes before dropping the manager, so
-        // checkpoints written since the last coalesced save survive restart.
+        // Then purge this model's KV from BOTH RAM and SSD on unload (#363) —
+        // restart warmth is intentionally OFF, so no KV (memory or disk) outlives
+        // the loaded model. purgeOnUnload drains in-flight writes, clears the RAM
+        // tier, deletes the kv/<modelKey> dir, and deregisters the accountant
+        // (subsumes the old flushIndexNow + deregisterFromAccountant).
         if let mgr = checkpointManager {
-            await mgr.flushIndexNow()
-            // Phase 3: deregister from the accountant before dropping the manager.
-            await mgr.deregisterFromAccountant()
+            await mgr.purgeOnUnload()
         }
         // Drop the checkpoint manager so a stale one can't serve the next
         // model (the new model's loadModel reinstalls its own, or nil).
@@ -1964,13 +2026,11 @@ public actor BatchScheduler {
         checkpointBoundaries = []
         checkpointLayerSignatures = []
 
-        // Close the engine-tier owner FIRST (before deregister) so no disk
-        // mutation slips through between deregistration and the dir being handed
-        // to a reloaded same-modelKey owner: a stale engine step finishing after
-        // `engine.stop()` (which doesn't fence an in-flight engineQueue step) or
-        // a late accountant eviction signal will now no-op. `engine.stop()` was
-        // already awaited above, so the GPU step loop is winding down by here.
-        engineTierOwner?.close()
+        // Purge the engine-tier owner's on-disk dir too (same kv/<modelKey> dir;
+        // whichever tier ran first already removed it, so this no-ops then).
+        // purgeDir latches `closed` first so any in-flight engine-step save that
+        // resumes after `engine.stop()` no-ops at its post-write bail.
+        engineTierOwner?.purgeDir()
         // Deregister the engine-tier owner from the accountant.
         if let accountant = diskAccountant, let token = engineTierAccountantToken {
             await accountant.deregister(token)
