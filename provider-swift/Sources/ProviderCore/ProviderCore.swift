@@ -41,5 +41,12 @@ public enum ProviderCore {
     // manual masked-attention fallback for padded decode, and .none decode masks
     // for unpadded single-token steps; submodule pin advanced to f2f40e5
     // (mlx-swift-lm#41).
-    public static let version = "0.6.11"
+    // 0.6.12 hardens memory & reliability: a 90% unified-memory cap with KV purge
+    // on unload + serve-while-load reservation (no more byte-OOM machine crashes),
+    // a bounded checkpoint-capture pipeline (stops the Metal [metal::malloc]
+    // resource-limit 499000 leak), resumable 4-bit model downloads, default-on
+    // [rsrc] resource telemetry in reports, and no raw request-parse errors in
+    // logs (prompt-fragment privacy). Submodule pin advanced to e7af9df
+    // (mlx-swift-lm#42).
+    public static let version = "0.6.12"
 }
