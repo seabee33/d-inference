@@ -135,13 +135,13 @@ func (d *dispatchState) traits() registry.RequestTraits {
 }
 
 // queueMaxTTFTMs returns the TTFT ceiling for queued requests. Public routes
-// inherit the OpenRouter 10s target; self-route / prefer-owner paths are not
-// subject to the public SLA ceiling.
-func queueMaxTTFTMs(policy selfRoutePolicy) float64 {
+// inherit the prompt-scaled admission threshold; self-route / prefer-owner paths
+// are not subject to the public SLA ceiling.
+func queueMaxTTFTMs(policy selfRoutePolicy, deadline time.Duration) float64 {
 	if policy.enabled || policy.prefer {
 		return 0
 	}
-	return openRouterTTFT429Threshold.Seconds() * 1000.0
+	return float64(deadline.Milliseconds())
 }
 
 // dispatchPrimary selects (and, when no idle provider exists on the first
@@ -181,13 +181,8 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 		// in-flight stream mid-way.
 		if dispatchErr == errTTFTTooSlow && attempt == 0 {
 			bestTTFT := time.Duration(decision.BestTTFTMs * float64(time.Millisecond))
-			retryAfter := s.estimateTTFTRetryAfter(d.model, bestTTFT)
-			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 			d.refundReservation()
-			s.ddIncr("routing.decisions", []string{"model:" + d.model, "model_type:" + s.registry.ModelType(d.model), "outcome:ttft_429"})
-			writeJSON(w, http.StatusTooManyRequests, errorResponse("rate_limit_exceeded",
-				fmt.Sprintf("all providers for model %q are above the %ds TTFT target (best estimate %.1fs); retry after %ds", d.publicModel, int(openRouterTTFT429Threshold.Seconds()), bestTTFT.Seconds(), retryAfter),
-				withCode("rate_limit_exceeded")))
+			s.writeTTFTTooSlow(w, d.model, d.publicModel, bestTTFT, d.deadline)
 			return outcomeResponseWritten
 		}
 
@@ -241,7 +236,7 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			PreferOwner:            d.policy.prefer,
 			OwnerAccountID:         d.policy.ownerAccountID,
 			FreeSelfRoute:          d.policy.enabled,
-			MaxTTFTMs:              queueMaxTTFTMs(d.policy),
+			MaxTTFTMs:              queueMaxTTFTMs(d.policy, d.deadline),
 			AcceptedCh:             make(chan struct{}, 1),
 			ChunkCh:                make(chan string, chunkBufferSize),
 			CompleteCh:             make(chan protocol.UsageInfo, 1),
@@ -270,9 +265,7 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			}
 			return outcomeResponseWritten
 		}
-		if depth, oldest := s.registry.Queue().QueueStats(d.model); depth > 0 {
-			s.registry.RecordWarmPoolQueueEnqueued(d.model, depth, oldest)
-		}
+		s.recordWarmPoolQueueState(d.model)
 		s.ddIncr("routing.decisions", []string{"model:" + d.model, "model_type:" + s.registry.ModelType(d.model), "outcome:queued"})
 
 		s.logger.Info("request queued, waiting for provider",
@@ -284,6 +277,7 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 		d.provider, err = s.registry.Queue().WaitForProviderContext(r.Context(), queuedReq)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
+				s.recordWarmPoolQueueState(d.model)
 				d.refundReservation()
 				return outcomeClientGone
 			}
@@ -302,6 +296,7 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			}
 			return outcomeResponseWritten
 		}
+		s.recordWarmPoolQueueState(d.model)
 		// Queue assigned a provider; still need to dispatch.
 		// Use the queue PR's channels.
 		d.pr = queuePR

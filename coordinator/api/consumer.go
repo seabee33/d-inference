@@ -88,11 +88,6 @@ const (
 	// block. Using context.Background() unbounded here risks hanging the HTTP
 	// handler goroutine when a WebSocket is half-dead.
 	cancelWriteTimeout = 2 * time.Second
-
-	// openRouterTTFT429Threshold is the hard admission target for external
-	// routers: if the fastest eligible provider is already estimated to miss a
-	// 10s TTFT, return a retryable 429 instead of letting the caller time out.
-	openRouterTTFT429Threshold = 10 * time.Second
 )
 
 var thinkBlockPattern = regexp.MustCompile(`(?is)<think>(.*?)</think>\s*`)
@@ -324,7 +319,7 @@ func (s *Server) maybeFallbackAliasCapacity(parsed map[string]any, publicModel, 
 	return target.Previous, candidates, rejections, tooLarge, bestTTFT, hasTTFT, true
 }
 
-func (s *Server) maybeFallbackAliasTTFT(parsed map[string]any, publicModel, currentModel string, estimatedPromptTokens, requestedMaxTokens int, traits registry.RequestTraits, requiresVision bool, allowedProviderSerials []string) (string, int, int, int, time.Duration, bool, bool) {
+func (s *Server) maybeFallbackAliasTTFT(parsed map[string]any, publicModel, currentModel string, estimatedPromptTokens, requestedMaxTokens int, ttftThreshold time.Duration, traits registry.RequestTraits, requiresVision bool, allowedProviderSerials []string) (string, int, int, int, time.Duration, bool, bool) {
 	if publicModel == "" || publicModel == currentModel {
 		return currentModel, 0, 0, 0, 0, false, false
 	}
@@ -336,15 +331,15 @@ func (s *Server) maybeFallbackAliasTTFT(parsed map[string]any, publicModel, curr
 		return currentModel, 0, 0, 0, 0, false, false
 	}
 	candidates, rejections, tooLarge, bestTTFT, hasTTFT := s.registry.QuickCapacityCheckWithTTFTForRequest(target.Previous, estimatedPromptTokens, requestedMaxTokens, traits, requiresVision, allowedProviderSerials...)
-	if candidates <= 0 || ttftTooSlow(bestTTFT, hasTTFT) {
+	if candidates <= 0 || ttftTooSlow(bestTTFT, hasTTFT, ttftThreshold) {
 		return target.Previous, candidates, rejections, tooLarge, bestTTFT, hasTTFT, false
 	}
 	parsed["model"] = target.Previous
 	return target.Previous, candidates, rejections, tooLarge, bestTTFT, hasTTFT, true
 }
 
-func ttftTooSlow(bestTTFT time.Duration, hasTTFT bool) bool {
-	return hasTTFT && bestTTFT > openRouterTTFT429Threshold
+func ttftTooSlow(bestTTFT time.Duration, hasTTFT bool, threshold time.Duration) bool {
+	return hasTTFT && bestTTFT > threshold
 }
 
 func fasterTTFTEstimate(primaryModel string, primary time.Duration, alternateModel string, alternate time.Duration, alternateOK bool) (string, time.Duration) {
@@ -354,8 +349,8 @@ func fasterTTFTEstimate(primaryModel string, primary time.Duration, alternateMod
 	return primaryModel, primary
 }
 
-func (s *Server) estimateTTFTRetryAfter(model string, bestTTFT time.Duration) int {
-	overage := bestTTFT - openRouterTTFT429Threshold
+func (s *Server) estimateTTFTRetryAfter(model string, bestTTFT, threshold time.Duration) int {
+	overage := bestTTFT - threshold
 	seconds := int(math.Ceil(overage.Seconds()))
 	if base := s.estimateRetryAfter(model); seconds < base {
 		seconds = base
@@ -369,13 +364,33 @@ func (s *Server) estimateTTFTRetryAfter(model string, bestTTFT time.Duration) in
 	return seconds
 }
 
-func (s *Server) writeTTFTTooSlow(w http.ResponseWriter, model, publicModel string, bestTTFT time.Duration) {
-	retryAfter := s.estimateTTFTRetryAfter(model, bestTTFT)
+func (s *Server) writeTTFTTooSlow(w http.ResponseWriter, model, publicModel string, bestTTFT, threshold time.Duration) {
+	retryAfter := s.estimateTTFTRetryAfter(model, bestTTFT, threshold)
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 	s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:ttft_429"})
 	writeJSON(w, http.StatusTooManyRequests, errorResponse("rate_limit_exceeded",
-		fmt.Sprintf("all providers for model %q are above the %ds TTFT target (best estimate %.1fs); retry after %ds", publicModel, int(openRouterTTFT429Threshold.Seconds()), bestTTFT.Seconds(), retryAfter),
+		fmt.Sprintf("all providers for model %q are above the %ds TTFT target (best estimate %.1fs); retry after %ds", publicModel, int(math.Ceil(threshold.Seconds())), bestTTFT.Seconds(), retryAfter),
 		withCode("rate_limit_exceeded")))
+}
+
+func (s *Server) triggerWarmPool() {
+	if s == nil || s.registry == nil {
+		return
+	}
+	s.registry.RequestWarmPoolTrigger()
+}
+
+func (s *Server) recordWarmPoolQueueState(model string) {
+	if s == nil || s.registry == nil || s.registry.Queue() == nil {
+		return
+	}
+	depth, oldest := s.registry.Queue().QueueStats(model)
+	if depth <= 0 {
+		s.registry.RecordWarmPoolQueueCleared(model)
+		return
+	}
+	s.registry.RecordWarmPoolQueueEnqueued(model, depth, oldest)
+	s.triggerWarmPool()
 }
 
 // dispatchOneProvider encrypts and sends an inference request to a single
@@ -447,7 +462,7 @@ func (s *Server) dispatchOneProvider(
 	// check authoritative: the router cannot select a provider whose estimated
 	// TTFT is above the threshold.
 	if !policy.enabled && !policy.prefer {
-		pr.MaxTTFTMs = openRouterTTFT429Threshold.Seconds() * 1000.0
+		pr.MaxTTFTMs = float64(ttftDeadline(estimatedPromptTokens).Milliseconds())
 	}
 
 	excludeList := func() []string {
@@ -689,7 +704,7 @@ func estimatePromptTokens(parsed map[string]any) int {
 		total += messagesPromptTokens(v)
 	}
 	if v, ok := parsed["input"]; ok {
-		total += approximateTokenCount(v)
+		total += inputPromptTokens(v)
 	}
 	if v, ok := parsed["prompt"]; ok {
 		total += approximateTokenCount(v)
@@ -777,7 +792,7 @@ func messageContentTokens(content any) int {
 			}
 			typ, _ := pm["type"].(string)
 			switch {
-			case typ == "text":
+			case typ == "text" || typ == "input_text":
 				if s, ok := pm["text"].(string); ok {
 					total += textTokens(s)
 				}
@@ -816,6 +831,38 @@ func messagesPromptTokens(messages any) int {
 		total += messageContentTokens(mm["content"])
 	}
 	return total
+}
+
+// inputPromptTokens estimates the Responses API `input` field. A string input
+// is plain text (len/4). Structured input is an array of message-like items with
+// `content` parts, so reuse the same media-aware content estimator as chat
+// messages instead of counting JSON wrapper bytes.
+func inputPromptTokens(input any) int {
+	switch x := input.(type) {
+	case string:
+		return approximateTokenCount(x)
+	case []any:
+		total := 0
+		for _, item := range x {
+			switch m := item.(type) {
+			case string:
+				total += approximateTokenCount(m)
+			case map[string]any:
+				content, ok := m["content"]
+				if !ok {
+					total += approximateTokenCount(m)
+					continue
+				}
+				total += 4 // role/type framing, matching messagesPromptTokens.
+				total += messageContentTokens(content)
+			default:
+				total += approximateTokenCount(item)
+			}
+		}
+		return total
+	default:
+		return approximateTokenCount(input)
+	}
 }
 
 // contentPartsHaveMedia reports whether a `content` value (a content-part array)
@@ -1564,6 +1611,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	estimatedPromptTokens := estimatePromptTokens(parsed)
 	billingPromptTokens := estimateBillingPromptTokens(parsed)
 	requestedMaxTokens := estimateRequestedMaxTokens(parsed)
+	deadline := ttftDeadline(estimatedPromptTokens)
 	timing.ParsedAt = time.Now()
 
 	if isResponsesAPI {
@@ -1649,6 +1697,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		// routing with a paid public fallback and the normal queue, which is the
 		// correct gate for prefer.
 	} else {
+		ttftThreshold := deadline
 		// Pre-flight capacity check: can ANY provider serve this model right
 		// now? If not, return 429 immediately rather than queueing for up to
 		// 120s. OpenRouter treats 429 as "rate limited" (no uptime penalty) vs
@@ -1686,6 +1735,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if candidateCount == 0 && capacityRejections > 0 {
 			s.registry.RecordWarmPoolCapacityReject(model)
+			s.triggerWarmPool()
 			// Providers exist for this model but ALL are at capacity.
 			retryAfter := s.estimateRetryAfter(model)
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
@@ -1716,8 +1766,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				withCode("model_unavailable")))
 			return
 		}
-		if ttftTooSlow(bestTTFT, hasTTFT) {
-			if fallbackModel, _, _, _, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAliasTTFT(parsed, publicModel, model, estimatedPromptTokens, requestedMaxTokens, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
+		if ttftTooSlow(bestTTFT, hasTTFT, ttftThreshold) {
+			if fallbackModel, _, _, _, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAliasTTFT(parsed, publicModel, model, estimatedPromptTokens, requestedMaxTokens, ttftThreshold, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
 				model = fallbackModel
 				if isResponsesAPI {
 					providerParsed, err := responsesRequestToChatCompletions(parsed)
@@ -1733,7 +1783,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else {
 				retryModel, retryTTFT := fasterTTFTEstimate(model, bestTTFT, fallbackModel, fallbackTTFT, fallbackHasTTFT)
 				refundReservation()
-				s.writeTTFTTooSlow(w, retryModel, publicModel, retryTTFT)
+				s.writeTTFTTooSlow(w, retryModel, publicModel, retryTTFT, ttftThreshold)
 				return
 			}
 		}
@@ -1755,8 +1805,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// commits exactly once, then writes attestation/timing headers and streams.
 	consumerKey := consumerKeyFromContext(r.Context())
 	consumerLocation := s.requestLocation(r)
-	deadline := ttftDeadline(estimatedPromptTokens)
-
 	// Final cap on the body we'll seal. The read cap (parseInferencePrelude)
 	// bounded the request as received, but rawBody has since been re-marshaled at
 	// several points — alias resolution, allowlist/routing-field stripping,
@@ -4110,6 +4158,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	estimatedPromptTokens := estimatePromptTokens(parsed)
 	billingPromptTokens := estimateBillingPromptTokens(parsed)
 	requestedMaxTokens := estimateRequestedMaxTokens(parsed)
+	genericDeadline := ttftDeadline(estimatedPromptTokens)
 
 	// Inject the endpoint so the provider knows which local path to forward to.
 	parsed["endpoint"] = endpoint
@@ -4183,6 +4232,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		}
 		if candidateCount == 0 && capacityRejections > 0 {
 			s.registry.RecordWarmPoolCapacityReject(model)
+			s.triggerWarmPool()
 			retryAfter := s.estimateRetryAfter(model)
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 			refundReservation()
@@ -4206,13 +4256,14 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 				withCode("model_unavailable")))
 			return
 		}
-		if ttftTooSlow(bestTTFT, hasTTFT) {
-			if fallbackModel, _, _, _, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAliasTTFT(parsed, publicModel, model, estimatedPromptTokens, requestedMaxTokens, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
+		ttftThreshold := genericDeadline
+		if ttftTooSlow(bestTTFT, hasTTFT, ttftThreshold) {
+			if fallbackModel, _, _, _, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAliasTTFT(parsed, publicModel, model, estimatedPromptTokens, requestedMaxTokens, ttftThreshold, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
 				model = fallbackModel
 			} else {
 				retryModel, retryTTFT := fasterTTFTEstimate(model, bestTTFT, fallbackModel, fallbackTTFT, fallbackHasTTFT)
 				refundReservation()
-				s.writeTTFTTooSlow(w, retryModel, publicModel, retryTTFT)
+				s.writeTTFTTooSlow(w, retryModel, publicModel, retryTTFT, ttftThreshold)
 				return
 			}
 		}
@@ -4254,7 +4305,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	// check authoritative: the router cannot select a provider whose estimated
 	// TTFT is above the threshold.
 	if !policy.enabled && !policy.prefer {
-		pr.MaxTTFTMs = openRouterTTFT429Threshold.Seconds() * 1000.0
+		pr.MaxTTFTMs = float64(genericDeadline.Milliseconds())
 	}
 
 	// refundExtra credits back the provider-specific surcharge that
@@ -4326,7 +4377,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		if decision.TTFTRejections > 0 {
 			bestTTFT := time.Duration(decision.BestTTFTMs * float64(time.Millisecond))
 			refundReservation()
-			s.writeTTFTTooSlow(w, model, publicModel, bestTTFT)
+			s.writeTTFTTooSlow(w, model, publicModel, bestTTFT, genericDeadline)
 			return
 		}
 
@@ -4362,13 +4413,12 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			}
 			return
 		}
-		if depth, oldest := s.registry.Queue().QueueStats(model); depth > 0 {
-			s.registry.RecordWarmPoolQueueEnqueued(model, depth, oldest)
-		}
+		s.recordWarmPoolQueueState(model)
 		s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:queued"})
 		provider, err = s.registry.Queue().WaitForProviderContext(r.Context(), queuedReq)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
+				s.recordWarmPoolQueueState(model)
 				refundReservation()
 				return
 			}
@@ -4386,6 +4436,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			}
 			return
 		}
+		s.recordWarmPoolQueueState(model)
 		decision = queuedReq.Decision
 	}
 	s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:selected"})
@@ -4521,7 +4572,6 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	// before committing. This mirrors the chat completions path but without
 	// speculative dispatch (single attempt). If the provider misses the
 	// TTFT deadline, the request fails instead of streaming forever.
-	genericDeadline := ttftDeadline(estimatedPromptTokens)
 	ttftTimer := time.NewTimer(genericDeadline)
 	var firstChunk string
 	committed := false
