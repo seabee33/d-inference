@@ -381,6 +381,24 @@ type Provider struct {
 	LastChallengeVerified time.Time // last successful challenge verification
 	FailedChallenges      int       // consecutive failed challenges
 
+	// challengeSettled is a per-connection buffered (cap 1) signal fired by the
+	// challenge path AFTER a challenge passes but the trust-reuse fast-skip did NOT
+	// grant hardware (DAR-326). It lets awaitTrustReuseGrant stop waiting
+	// immediately for a non-fast-skip provider instead of stalling up to
+	// trustReuseGrantWait before falling back to the full live MDM verify. Created
+	// fresh per Provider (so it never carries a stale signal across reconnects); a
+	// nil channel degrades safely to the timer-based wait.
+	challengeSettled chan struct{}
+
+	// untrustEpoch is bumped on every HARD untrust of this provider (DAR-326
+	// FIX A). The trust-reuse write-through (api.recordTrustReuse) captures it at
+	// grant time and re-checks it immediately before persisting; a bump in between
+	// means a hard untrust raced the grant, so the stale `hardware` row is not
+	// persisted. This closes the write-after-delete race where an async write could
+	// land AFTER the hard-untrust's synchronous delete and resurrect a row that a
+	// restart would reseed. atomic so it is read/written without p.mu.
+	untrustEpoch atomic.Uint64
+
 	// untrustedRecoverable marks an untrust as a *transient* missed-challenge
 	// deroute (timeout / no-response) that may self-recover on the next passing
 	// challenge. It is false for every hard/security deroute. In-memory only —
@@ -520,6 +538,17 @@ func (p *Provider) GetStatus() ProviderStatus {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.Status
+}
+
+// SetACMEVerified sets the ACME-verified flag (thread-safe). Used to clear a
+// flag that applyACMETrust set optimistically (it marks the cert verified before
+// the SE-key binding completes) when a trust-reuse fast-skip grants hardware via
+// MDM-reuse and the stashed ACME never bound (DAR-326 FIX 4a) — so the attestation
+// report does not claim acme_verified for an unproven binding.
+func (p *Provider) SetACMEVerified(v bool) {
+	p.mu.Lock()
+	p.ACMEVerified = v
+	p.mu.Unlock()
 }
 
 // SetMDMFailureReason records the bucketed reason this connection's MDM
@@ -680,6 +709,52 @@ func (p *Provider) ChallengeShouldStop() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.Status == StatusUntrusted && !p.untrustedRecoverable
+}
+
+// SignalChallengeSettled fires the per-connection "challenge settled without a
+// trust-reuse fast-skip grant" signal (non-blocking; buffered cap 1). The
+// mdmVerificationLoop's awaitTrustReuseGrant selects on it so a non-fast-skip
+// provider proceeds to the full live MDM verify immediately instead of stalling
+// the trust-reuse grace window (DAR-326). The channel is set once at construction
+// and never reassigned, so no lock is needed; a nil channel is a no-op.
+func (p *Provider) SignalChallengeSettled() {
+	if p.challengeSettled == nil {
+		return
+	}
+	select {
+	case p.challengeSettled <- struct{}{}:
+	default: // a prior signal is still buffered — one is enough to stop the wait
+	}
+}
+
+// ChallengeSettledChan returns the per-connection challenge-settled signal for
+// awaitTrustReuseGrant to select on. May be nil for a zero-value Provider (the
+// select then simply never fires that case and falls back to the timer).
+func (p *Provider) ChallengeSettledChan() <-chan struct{} {
+	return p.challengeSettled
+}
+
+// ResetChallengeSettled drains any buffered challenge-settled signal so a fresh
+// connection can never consume a stale one (DAR-326 FIX 4c). Register allocates a
+// fresh channel per connection, so this is also belt-and-suspenders that keeps the
+// connection-scoping invariant explicit and robust to any future Provider reuse.
+// Non-blocking; safe on a nil channel.
+func (p *Provider) ResetChallengeSettled() {
+	if p.challengeSettled == nil {
+		return
+	}
+	select {
+	case <-p.challengeSettled:
+	default:
+	}
+}
+
+// HardUntrustEpoch returns the current hard-untrust epoch (thread-safe). It is
+// bumped on every hard untrust; the trust-reuse write-through captures it at grant
+// time and re-checks it before persisting so a hard untrust that races a grant
+// cannot leave a stale, reseedable `hardware` row (DAR-326 FIX A).
+func (p *Provider) HardUntrustEpoch() uint64 {
+	return p.untrustEpoch.Load()
 }
 
 // SetAttestationResult stores a snapshot of the parsed attestation result
@@ -935,6 +1010,14 @@ type Registry struct {
 	warmPool             *warmPoolController
 	// loadModelSender is a test seam for SendLoadModel. Nil uses the provider WebSocket.
 	loadModelSender func(providerID, modelID string) error
+
+	// onHardUntrust is an optional hook fired (off the registry locks) whenever a
+	// provider is HARD-untrusted (a non-recoverable security deroute). The api
+	// layer wires it to invalidate that device's trust-reuse record (DAR-326), so
+	// "hard untrust always takes effect" stays durable across coordinator
+	// restarts. Keyed by the device's Secure Enclave public key. Set once at
+	// startup; nil = no-op. Guarded by r.mu (set + read).
+	onHardUntrust func(seKey string)
 }
 
 // pendingModelLoadTTL bounds how long an outstanding (or failed) load_model
@@ -2236,7 +2319,13 @@ func (r *Registry) Register(id string, conn *websocket.Conn, msg *protocol.Regis
 		LastHeartbeat:           time.Now(),
 		Reputation:              NewReputation(),
 		pendingReqs:             make(map[string]*PendingRequest),
+		challengeSettled:        make(chan struct{}, 1),
 	}
+
+	// Connection-scope the challenge-settled signal (DAR-326 FIX 4c): the channel is
+	// freshly allocated above, and draining here makes the "no stale signal carries
+	// into a new connection" invariant explicit and robust to future Provider reuse.
+	p.ResetChallengeSettled()
 
 	r.mu.Lock()
 	r.providers[id] = p
@@ -3230,6 +3319,17 @@ func (r *Registry) CountProvidersByBinaryHash(hash string) int {
 	return count
 }
 
+// SetHardUntrustHook registers an optional callback fired whenever a provider is
+// HARD-untrusted (non-recoverable). It is invoked with the device's Secure Enclave
+// public key, off the registry locks, so the callback may do store I/O. The api
+// layer uses it to invalidate the device's trust-reuse record (DAR-326). Set once
+// at startup before providers connect; nil clears it. Thread-safe.
+func (r *Registry) SetHardUntrustHook(fn func(seKey string)) {
+	r.mu.Lock()
+	r.onHardUntrust = fn
+	r.mu.Unlock()
+}
+
 // MarkUntrusted sets a provider's status to untrusted for a hard/security
 // reason (bad encrypted chunk, MDM/MDA failure, SIP disabled, binary or model
 // hash mismatch, serial impersonation, attestation failure). The deroute is
@@ -3271,6 +3371,7 @@ func (r *Registry) markUntrusted(providerID string, recoverable bool) {
 		r.mu.Unlock()
 		return
 	}
+	hook := r.onHardUntrust // capture under r.mu (race-safe)
 
 	p.mu.Lock()
 	if p.Status != StatusUntrusted {
@@ -3284,6 +3385,11 @@ func (r *Registry) markUntrusted(providerID string, recoverable bool) {
 		p.untrustedRecoverable = false
 	}
 	failed := p.FailedChallenges // read under p.mu (the old code read this unlocked)
+	// Capture the SE key for the hard-untrust hook while we hold p.mu.
+	var seKey string
+	if !recoverable && p.AttestationResult != nil {
+		seKey = p.AttestationResult.PublicKey
+	}
 	p.mu.Unlock()
 	r.mu.Unlock()
 
@@ -3292,6 +3398,23 @@ func (r *Registry) markUntrusted(providerID string, recoverable bool) {
 		"failed_challenges", failed,
 		"recoverable", recoverable,
 	)
+
+	// A HARD untrust invalidates the device's trust-reuse record (in-memory +
+	// persisted) so a later reconnect cannot fast-skip the live MDM re-verification
+	// on a stale, pre-untrust record (DAR-326). Fired after releasing the locks; a
+	// transient (recoverable) untrust does NOT invalidate — it can self-recover via
+	// a passing challenge.
+	if !recoverable {
+		// FIX A: bump the hard-untrust epoch BEFORE firing the delete hook. A
+		// concurrent recordTrustReuse that captured the old epoch at grant time then
+		// sees the change on its pre-upsert recheck and refuses to persist a stale
+		// `hardware` row — closing the write-after-delete race (a write landing after
+		// the synchronous delete that a restart would otherwise reseed).
+		p.untrustEpoch.Add(1)
+		if hook != nil && seKey != "" {
+			hook(seKey)
+		}
+	}
 }
 
 // SetTrustLevel updates a provider's trust level (thread-safe).

@@ -949,6 +949,96 @@ func TestMarkUntrusted(t *testing.T) {
 	}
 }
 
+// TestHardUntrustHook proves the DAR-326 invalidation hook fires with the
+// device's SE public key on a HARD untrust, but NOT on a transient (recoverable)
+// untrust — so a missed-challenge deroute that can self-recover does not drop the
+// trust-reuse record, while a real security deroute durably invalidates it.
+func TestHardUntrustHook(t *testing.T) {
+	reg := New(testLogger())
+	msg := testRegisterMessage()
+	p := reg.Register("p1", nil, msg)
+	p.mu.Lock()
+	p.AttestationResult = &attestation.VerificationResult{PublicKey: "se-key-1"}
+	p.mu.Unlock()
+
+	var mu sync.Mutex
+	var fired []string
+	reg.SetHardUntrustHook(func(seKey string) {
+		mu.Lock()
+		fired = append(fired, seKey)
+		mu.Unlock()
+	})
+
+	// A transient untrust must NOT fire the hook.
+	reg.MarkUntrustedTransient("p1")
+	mu.Lock()
+	if len(fired) != 0 {
+		t.Fatalf("transient untrust must not fire the hard-untrust hook, got %v", fired)
+	}
+	mu.Unlock()
+
+	// A hard untrust must fire the hook with the device's SE key.
+	reg.MarkUntrusted("p1")
+	mu.Lock()
+	if len(fired) != 1 || fired[0] != "se-key-1" {
+		t.Fatalf("hard untrust must fire the hook with the SE key, got %v", fired)
+	}
+	mu.Unlock()
+}
+
+// TestHardUntrustEpoch proves the DAR-326 FIX A epoch counter: it starts at 0,
+// bumps on every HARD untrust, and does NOT bump on a transient untrust (which can
+// self-recover). recordTrustReuse captures + re-checks this epoch to refuse a
+// stale write that races a hard untrust.
+func TestHardUntrustEpoch(t *testing.T) {
+	reg := New(testLogger())
+	p := reg.Register("p1", nil, testRegisterMessage())
+
+	if e := p.HardUntrustEpoch(); e != 0 {
+		t.Fatalf("fresh provider epoch = %d, want 0", e)
+	}
+
+	// A transient untrust must NOT bump the epoch.
+	reg.MarkUntrustedTransient("p1")
+	if e := p.HardUntrustEpoch(); e != 0 {
+		t.Fatalf("transient untrust must not bump the epoch, got %d", e)
+	}
+
+	// Each hard untrust bumps it (monotonic).
+	reg.MarkUntrusted("p1")
+	if e := p.HardUntrustEpoch(); e != 1 {
+		t.Fatalf("epoch after first hard untrust = %d, want 1", e)
+	}
+	reg.MarkUntrusted("p1")
+	if e := p.HardUntrustEpoch(); e != 2 {
+		t.Fatalf("epoch after second hard untrust = %d, want 2", e)
+	}
+}
+
+// TestResetChallengeSettledDrainsStaleSignal proves DAR-326 FIX 4c: a freshly
+// registered provider carries no settled signal, and ResetChallengeSettled drains a
+// buffered one so a new connection cannot consume a stale signal.
+func TestResetChallengeSettledDrainsStaleSignal(t *testing.T) {
+	reg := New(testLogger())
+	p := reg.Register("p1", nil, testRegisterMessage())
+
+	// A freshly-registered provider's signal is empty (Register resets it).
+	select {
+	case <-p.ChallengeSettledChan():
+		t.Fatal("a freshly-registered provider must have no buffered settled signal")
+	default:
+	}
+
+	// Buffer a (stale) signal, then reset → drained.
+	p.SignalChallengeSettled()
+	p.ResetChallengeSettled()
+	select {
+	case <-p.ChallengeSettledChan():
+		t.Fatal("ResetChallengeSettled must drain the buffered signal")
+	default:
+	}
+}
+
 func TestFindProviderSkipsUntrusted(t *testing.T) {
 	reg := New(testLogger())
 	msg := testRegisterMessage()

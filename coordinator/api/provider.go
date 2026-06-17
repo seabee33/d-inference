@@ -954,6 +954,38 @@ func (s *Server) clearPendingACME(providerID string) {
 	s.pendingACMEMu.Unlock()
 }
 
+// hasPendingACME reports whether a connect-time ACME result is still stashed for a
+// provider (i.e. its SE-key binding has not completed — applyACMETrust clears it on
+// a successful bind).
+func (s *Server) hasPendingACME(providerID string) bool {
+	s.pendingACMEMu.Lock()
+	_, ok := s.pendingACME[providerID]
+	s.pendingACMEMu.Unlock()
+	return ok
+}
+
+// reconcileACMEAfterFastSkip keeps ACMEVerified honest after a trust-reuse
+// fast-skip granted hardware via MDM-reuse (DAR-326 FIX 4a). applyACMETrust sets
+// ACMEVerified=true as soon as a device cert is valid, BEFORE its SE-key binding is
+// proven (the binding needs a passing challenge). The challenge has now passed, so
+// try the binding once: if it binds, ACME genuinely backs hardware and the flag is
+// legitimate (applyACMETrust clears the pending result on success). If it still
+// does not bind, the cert was never proven against the attested SE key, so we must
+// NOT report acme_verified=true off an MDM-reuse grant — clear the flag and discard
+// the stale pending result. No-op when nothing is stashed (then any ACMEVerified
+// was already granted+bound, or was never set).
+func (s *Server) reconcileACMEAfterFastSkip(providerID string, provider *registry.Provider) {
+	if !s.hasPendingACME(providerID) {
+		return
+	}
+	s.retryACMETrust(providerID, provider)
+	if s.hasPendingACME(providerID) {
+		// Binding still did not complete → unbound ACME. Don't claim ACME proof.
+		provider.SetACMEVerified(false)
+		s.clearPendingACME(providerID)
+	}
+}
+
 // retryACMETrust re-applies a stashed ACME result. Called from the
 // challenge-success path so a provider whose device cert was presented at
 // connect — but whose attestation had not yet bound — gets upgraded to
@@ -1626,12 +1658,41 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 	trustLevel := provider.TrustLevel
 	provider.Mu().Unlock()
 
-	// Re-attempt ACME (mTLS device-cert) trust for self_signed providers.
-	// applyACMETrust ran at registration before attestation was bound, so a
-	// provider that presented a valid device cert can be promoted to hardware
-	// now that the challenge has passed. No-op if nothing was stashed.
 	if trustLevel == registry.TrustSelfSigned {
-		s.retryACMETrust(providerID, provider)
+		// DAR-326 Phase 0: trust-reuse fast-skip. The live SE challenge above just
+		// re-proved this connection's identity + posture. If this device recently
+		// passed a FULL live MDM verification (a fresh trust-reuse record) and the
+		// fresh SIGNED challenge re-proves the SAME identity, an unchanged binary,
+		// and good posture within the window, grant hardware now — letting the
+		// per-connection mdmVerificationLoop SKIP its live MDM SecurityInfo
+		// round-trip. This is what avoids a fleet-wide MDM/APNs herd on a planned
+		// coordinator restart/swap. SECURITY: the live SE challenge always ran
+		// first; any gate miss (no record, binary changed, posture bad/unsigned,
+		// window elapsed, hard-untrusted) returns false and falls through to the
+		// unchanged full live MDM verify.
+		if s.tryTrustReuseFastSkip(providerID, provider, resp, statusFieldsTrusted) {
+			// DAR-326 FIX 3: the fast-skip just granted hardware, so this provider is
+			// freshly routable — drain any queued requests now instead of waiting for
+			// the next heartbeat / 120s queue timeout. Off the challenge goroutine,
+			// mirroring the code-attest / MDM hardware-grant drain.
+			saferun.Go(s.logger, "trustReuseDrain", func() {
+				s.registry.DrainQueuedRequestsForProvider(provider)
+			})
+			// FIX 4a: keep ACMEVerified honest after an MDM-reuse grant — a connect-time
+			// cert may have set the flag before its SE-key binding completed.
+			s.reconcileACMEAfterFastSkip(providerID, provider)
+		} else {
+			// Fast-skip missed. FIX 4b: re-attempt ACME FIRST — applyACMETrust ran at
+			// registration before attestation was bound, so a provider that presented a
+			// valid device cert can be promoted to hardware now that the challenge has
+			// passed, WITHOUT forcing a live MDM round-trip. Only nudge the
+			// mdmVerificationLoop (SignalChallengeSettled, so it stops deferring and
+			// runs the live verify) if ACME did NOT grant hardware.
+			s.retryACMETrust(providerID, provider)
+			if provider.GetTrustLevel() != registry.TrustHardware {
+				provider.SignalChallengeSettled()
+			}
+		}
 	}
 }
 
@@ -2722,6 +2783,21 @@ func (s *Server) verifyProviderViaMDM(ctx context.Context, providerID string, pr
 	// Persist the trust upgrade.
 	s.registry.PersistProvider(provider)
 
+	// DAR-326 Phase 0: record this FULL live MDM verification in the trust-reuse
+	// cache (in-memory + durable) so a planned coordinator restart/swap can
+	// fast-skip this device's live MDM round-trip — once a fresh live SE challenge
+	// re-proves the same identity, unchanged binary, and good posture within the
+	// window. Written only here, AFTER the verified MDM pass + hardware grant.
+	s.recordTrustReuse(
+		provider,
+		attestResult.PublicKey,
+		attestResult.SerialNumber,
+		attestResult.BinaryHash,
+		mdmResult.MDMSIPEnabled,
+		mdmResult.MDMSecureBootFull,
+		mdmResult.UDID,
+	)
+
 	// Request Apple Device Attestation — Apple's servers generate a
 	// certificate chain that proves this device's identity. This cert
 	// chain can be independently verified by users against Apple's
@@ -2800,6 +2876,29 @@ func (s *Server) ApplyLateSecurityInfo(udid string, info *mdm.SecurityInfoRespon
 			"udid", udid,
 		)
 		s.registry.PersistProvider(c.provider)
+
+		// DAR-326 FIX B: cache this late grant in the trust-reuse cache too, so it
+		// gets the same restart-survivable fast-skip as the synchronous MDM path.
+		// Posture was confirmed good above (SIP on + Secure Boot full). Uses the
+		// same epoch-checked synchronous write-through (recordTrustReuse) — a
+		// concurrent hard untrust is detected and not persisted. seKey + binary hash
+		// come from the registration-bound SE attestation.
+		//
+		// FIX 1: nil-guard the derivation. The candidate set guaranteed a valid
+		// attestation + non-empty serial, but NOT a non-empty SE key or binary hash
+		// (Swift providers may omit the self-reported binary hash). Skip caching
+		// rather than call recordTrustReuse with empty values (which it would reject
+		// anyway) — keeps the intent explicit and avoids a useless call.
+		c.provider.Mu().Lock()
+		var seKey, binaryHash string
+		if c.provider.AttestationResult != nil {
+			seKey = c.provider.AttestationResult.PublicKey
+			binaryHash = c.provider.AttestationResult.BinaryHash
+		}
+		c.provider.Mu().Unlock()
+		if seKey != "" && binaryHash != "" {
+			s.recordTrustReuse(c.provider, seKey, c.serial, binaryHash, true /*sip*/, true /*secureBootFull*/, udid)
+		}
 	}
 }
 
@@ -2839,6 +2938,22 @@ func (s *Server) mdmVerificationLoop(ctx context.Context, providerID string, pro
 	// passed (verifyProviderAttestation returns early otherwise).
 	if result == nil || !result.Valid || result.SerialNumber == "" {
 		return
+	}
+
+	// DAR-326 Phase 0: if this device has a fresh trust-reuse record (it recently
+	// passed a FULL live MDM verification), give the live SE challenge a brief head
+	// start to re-prove identity + posture and grant hardware via the trust-reuse
+	// fast-skip BEFORE we run the (herd-causing) live MDM SecurityInfo round-trip.
+	// Without this, this loop's immediate first attempt would race ahead of the
+	// challenge and re-run the full verify anyway, recreating the fleet-wide MDM/APNs
+	// herd on a planned coordinator restart/swap. Only candidates wait; a first-ever
+	// / expired device proceeds straight to the full live verify (unchanged). If the
+	// challenge does not grant within the window (slow / gate miss / hard untrust),
+	// we fall through to the unchanged full live MDM verify below.
+	if s.trustReuseCache.hasFreshRecord(result.PublicKey, result.SerialNumber) {
+		if s.awaitTrustReuseGrant(ctx, provider) {
+			return // fast-skip granted hardware — no live MDM round-trip needed
+		}
 	}
 
 	// One attempt up front, then a gentle cadence. The initial push (with the
