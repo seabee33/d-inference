@@ -2062,6 +2062,7 @@ func TestWriteTTFTTooSlowSets429RetryAfter(t *testing.T) {
 
 func TestTTFTAdmission429BelowOldTenSecondFloor(t *testing.T) {
 	srv, _ := testServer(t)
+	srv.SetTTFTHardReject(true) // legacy hard 429-on-slow-estimate path (now opt-in)
 	model := "exact-ttft-floor-model"
 	srv.registry.SetModelCatalog([]registry.CatalogEntry{{ID: model, SizeGB: 1, MinRAMGB: 24}})
 	p := registerBuildsProvider(srv, "exact-floor-provider", model)
@@ -2087,6 +2088,7 @@ func TestTTFTAdmission429BelowOldTenSecondFloor(t *testing.T) {
 
 func TestTTFTAdmission429ForInferenceEndpoints(t *testing.T) {
 	srv, _ := testServer(t)
+	srv.SetTTFTHardReject(true) // legacy hard 429-on-slow-estimate path (now opt-in)
 	model := "route-slow-ttft-model"
 	srv.registry.SetModelCatalog([]registry.CatalogEntry{{ID: model, SizeGB: 1, MinRAMGB: 24}})
 	p := registerBuildsProvider(srv, "route-slow-provider", model)
@@ -2134,7 +2136,8 @@ func TestTTFTAdmission429ForInferenceEndpoints(t *testing.T) {
 			}
 			var body struct {
 				Error struct {
-					Code string `json:"code"`
+					Code    string `json:"code"`
+					Message string `json:"message"`
 				} `json:"error"`
 			}
 			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
@@ -2143,7 +2146,41 @@ func TestTTFTAdmission429ForInferenceEndpoints(t *testing.T) {
 			if body.Error.Code != "rate_limit_exceeded" {
 				t.Fatalf("code = %q, want rate_limit_exceeded", body.Error.Code)
 			}
+			// Assert the TTFT preflight path specifically (not a capacity 429),
+			// so this test exercises the hard TTFT gate it is named for.
+			if !strings.Contains(body.Error.Message, "TTFT target") {
+				t.Fatalf("message = %q, want TTFT target detail", body.Error.Message)
+			}
 		})
+	}
+}
+
+// TestTTFTSoftGateDoesNotShedAtDispatch is the regression for the Codex P1: in
+// the default SOFT gate, an over-deadline request must not be rejected as
+// ttft_too_slow — not at the preflight AND not (the bug) at dispatch via a
+// non-zero pr.MaxTTFTMs causing ReserveProviderEx to drop every candidate. With
+// a single eligible provider and no capacity pressure, the only possible 429 is
+// the TTFT shed, so asserting "not 429" pins the fix. (The request can't truly
+// stream over a nil test conn; it just must never be ttft-rejected.)
+func TestTTFTSoftGateDoesNotShedAtDispatch(t *testing.T) {
+	srv, _ := testServer(t) // default: soft gate (ttftHardReject=false)
+	model := "soft-serve-ttft-model"
+	srv.registry.SetModelCatalog([]registry.CatalogEntry{{ID: model, SizeGB: 1, MinRAMGB: 24}})
+	p := registerBuildsProvider(srv, "slow-prefill-provider", model)
+	p.Mu().Lock()
+	p.DecodeTPS = 100
+	p.PrefillTPS = 0.2 // ~5s prefill even for a tiny prompt => TTFT estimate >> deadline
+	p.Mu().Unlock()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+		strings.ReplaceAll(`{"model":"MODEL","messages":[{"role":"user","content":"hello"}],"max_tokens":16}`, "MODEL", model)))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code == http.StatusTooManyRequests {
+		t.Fatalf("soft gate shed an over-deadline request with 429 (P1 regression); body=%s", w.Body.String())
 	}
 }
 
