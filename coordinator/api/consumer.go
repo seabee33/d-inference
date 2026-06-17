@@ -430,6 +430,8 @@ func rejectionSamplingParams(parsed map[string]any) json.RawMessage {
 // error string on failure. The excludeProviders set is updated on failure.
 // selfRoutePolicy and its resolvers live in self_route.go.
 
+type routeDecisionRecorder func(*registry.Provider, *registry.PendingRequest, registry.RoutingDecision)
+
 func (s *Server) dispatchOneProvider(
 	r *http.Request,
 	model string,
@@ -451,6 +453,7 @@ func (s *Server) dispatchOneProvider(
 	cacheAffinityKey string,
 	excludeProviders map[string]struct{},
 	attempt int,
+	recordRoute routeDecisionRecorder,
 ) (
 	provider *registry.Provider,
 	pr *registry.PendingRequest,
@@ -546,6 +549,9 @@ func (s *Server) dispatchOneProvider(
 	defer cleanupPending()
 	if pr.Timing != nil {
 		pr.Timing.RoutedAt = time.Now()
+	}
+	if recordRoute != nil {
+		recordRoute(provider, pr, decision)
 	}
 
 	// A request settles FREE when it's served by a machine the caller owns:
@@ -649,6 +655,9 @@ func (s *Server) dispatchOneProvider(
 		cleanupPending()
 		return nil, nil, decision, "failed to marshal request", http.StatusInternalServerError
 	}
+	if pr.Timing != nil {
+		pr.Timing.DispatchedAt = time.Now()
+	}
 	if err := provider.Conn.Write(r.Context(), websocket.MessageText, data); err != nil {
 		refundExtra()
 		cleanupPending()
@@ -656,9 +665,6 @@ func (s *Server) dispatchOneProvider(
 		return nil, nil, decision, "failed to send request to provider", http.StatusBadGateway
 	}
 	pendingCleanup = false
-	if pr.Timing != nil {
-		pr.Timing.DispatchedAt = time.Now()
-	}
 
 	return provider, pr, decision, "", 0
 }
@@ -2278,6 +2284,7 @@ func (s *Server) handleStreamingResponseWithFirstChunk(w http.ResponseWriter, r 
 						s.refundReservedBalance(pr, "provider_error:"+pr.RequestID)
 						s.noteInferenceError(pr.ProviderID, pr, errMsg.StatusCode)
 						s.ddIncr("inference.in_band_error", []string{"model:" + pr.Model, "reason:provider_error"})
+						s.updateInferenceRouteOutcomeForPending(pr, postCommitProviderErrorOutcome(pr, errMsg))
 						errData, _ := json.Marshal(map[string]any{
 							"error": map[string]any{
 								"message": errMsg.Error,
@@ -2292,6 +2299,7 @@ func (s *Server) handleStreamingResponseWithFirstChunk(w http.ResponseWriter, r 
 				}
 				if s.refundReservedBalance(pr, "provider_incomplete:"+pr.RequestID) {
 					s.ddIncr("inference.in_band_error", []string{"model:" + pr.Model, "reason:provider_incomplete"})
+					s.updateInferenceRouteOutcomeForPending(pr, postCommitProviderIncompleteOutcome(pr))
 					fmt.Fprintf(w, "data: {\"error\":{\"message\":\"provider ended without completion\",\"type\":\"provider_error\"}}\n\n")
 					flusher.Flush()
 					return
@@ -2420,6 +2428,7 @@ func (s *Server) handleStreamingResponseWithFirstChunk(w http.ResponseWriter, r 
 			s.refundReservedBalance(pr, "provider_error:"+pr.RequestID)
 			s.noteInferenceError(pr.ProviderID, pr, errMsg.StatusCode)
 			s.ddIncr("inference.in_band_error", []string{"model:" + pr.Model, "reason:provider_error"})
+			s.updateInferenceRouteOutcomeForPending(pr, postCommitProviderErrorOutcome(pr, errMsg))
 			errData, _ := json.Marshal(map[string]any{
 				"error": map[string]any{
 					"message": errMsg.Error,
@@ -2433,6 +2442,7 @@ func (s *Server) handleStreamingResponseWithFirstChunk(w http.ResponseWriter, r 
 		case <-timer.C:
 			s.refundReservedBalance(pr, "provider_timeout:"+pr.RequestID)
 			s.ddIncr("inference.in_band_error", []string{"model:" + pr.Model, "reason:timeout"})
+			s.updateInferenceRouteOutcomeForPending(pr, postCommitStreamTimeoutOutcome(pr))
 			fmt.Fprintf(w, "data: {\"error\":{\"message\":\"request timed out\",\"type\":\"timeout\"}}\n\n")
 			flusher.Flush()
 			return
@@ -2486,6 +2496,7 @@ func (s *Server) handleResponsesStreamingResponseWithFirstChunk(w http.ResponseW
 				}
 				if !completed && s.refundReservedBalance(pr, "provider_incomplete:"+pr.RequestID) {
 					s.ddIncr("inference.in_band_error", []string{"model:" + pr.Model, "reason:provider_incomplete"})
+					s.updateInferenceRouteOutcomeForPending(pr, postCommitProviderIncompleteOutcome(pr))
 					emitter.emitError("provider_error", "provider ended without completion")
 					return
 				}
@@ -2509,12 +2520,14 @@ func (s *Server) handleResponsesStreamingResponseWithFirstChunk(w http.ResponseW
 			s.refundReservedBalance(pr, "provider_error:"+pr.RequestID)
 			s.noteInferenceError(pr.ProviderID, pr, errMsg.StatusCode)
 			s.ddIncr("inference.in_band_error", []string{"model:" + pr.Model, "reason:provider_error"})
+			s.updateInferenceRouteOutcomeForPending(pr, postCommitProviderErrorOutcome(pr, errMsg))
 			emitter.emitError("provider_error", errMsg.Error)
 			return
 
 		case <-timer.C:
 			s.refundReservedBalance(pr, "provider_timeout:"+pr.RequestID)
 			s.ddIncr("inference.in_band_error", []string{"model:" + pr.Model, "reason:timeout"})
+			s.updateInferenceRouteOutcomeForPending(pr, postCommitStreamTimeoutOutcome(pr))
 			emitter.emitError("timeout", "request timed out")
 			return
 
@@ -2548,6 +2561,7 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 					if ok && errMsg.Error != "" {
 						s.refundReservedBalance(pr, "provider_error:"+pr.RequestID)
 						s.noteInferenceError(pr.ProviderID, pr, errMsg.StatusCode)
+						s.updateInferenceRouteOutcomeForPending(pr, preResponseProviderErrorOutcome(pr, errMsg))
 						statusCode := errMsg.StatusCode
 						if statusCode == 0 {
 							statusCode = http.StatusBadGateway
@@ -2575,13 +2589,20 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 							case u, ok := <-pr.CompleteCh:
 								if !ok {
 									s.refundReservedBalance(pr, "provider_incomplete:"+pr.RequestID)
+									s.updateInferenceRouteOutcomeForPending(pr, preResponseProviderIncompleteOutcome(pr))
 									writeJSON(w, http.StatusBadGateway, errorResponse("provider_error", "provider ended without completion"))
 									return
 								}
 								completeUsage = u
 							case <-ctx.Done():
-								s.refundReservedBalance(pr, "provider_timeout:"+pr.RequestID)
-								writeJSON(w, http.StatusGatewayTimeout, errorResponse("timeout", "timed out waiting for usage info"))
+								if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+									s.refundReservedBalance(pr, "provider_timeout:"+pr.RequestID)
+									s.updateInferenceRouteOutcomeForPending(pr, preResponseTimeoutOutcome(pr, "usage_timeout_before_response"))
+									writeJSON(w, http.StatusGatewayTimeout, errorResponse("timeout", "timed out waiting for usage info"))
+								} else {
+									s.refundReservedBalance(pr, "client_gone:"+pr.RequestID)
+									s.updateInferenceRouteOutcomeForPending(pr, clientGoneBeforeResponseOutcome(pr))
+								}
 								return
 							}
 							if objType == "chat.completion" {
@@ -2638,6 +2659,7 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 				case usage, ok := <-pr.CompleteCh:
 					if !ok {
 						s.refundReservedBalance(pr, "provider_incomplete:"+pr.RequestID)
+						s.updateInferenceRouteOutcomeForPending(pr, preResponseProviderIncompleteOutcome(pr))
 						writeJSON(w, http.StatusBadGateway, errorResponse("provider_error", "provider ended without completion"))
 						return
 					}
@@ -2650,8 +2672,14 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 					s.noteInferenceSuccess(pr)
 					writeJSON(w, http.StatusOK, resp)
 				case <-ctx.Done():
-					s.refundReservedBalance(pr, "provider_timeout:"+pr.RequestID)
-					writeJSON(w, http.StatusGatewayTimeout, errorResponse("timeout", "timed out waiting for usage info"))
+					if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+						s.refundReservedBalance(pr, "provider_timeout:"+pr.RequestID)
+						s.updateInferenceRouteOutcomeForPending(pr, preResponseTimeoutOutcome(pr, "usage_timeout_before_response"))
+						writeJSON(w, http.StatusGatewayTimeout, errorResponse("timeout", "timed out waiting for usage info"))
+					} else {
+						s.refundReservedBalance(pr, "client_gone:"+pr.RequestID)
+						s.updateInferenceRouteOutcomeForPending(pr, clientGoneBeforeResponseOutcome(pr))
+					}
 				}
 				return
 			}
@@ -2663,6 +2691,7 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 			}
 			s.refundReservedBalance(pr, "provider_error:"+pr.RequestID)
 			s.noteInferenceError(pr.ProviderID, pr, errMsg.StatusCode)
+			s.updateInferenceRouteOutcomeForPending(pr, preResponseProviderErrorOutcome(pr, errMsg))
 			statusCode := errMsg.StatusCode
 			if statusCode == 0 {
 				statusCode = http.StatusBadGateway
@@ -2671,8 +2700,14 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 			return
 
 		case <-ctx.Done():
-			s.refundReservedBalance(pr, "provider_timeout:"+pr.RequestID)
-			writeJSON(w, http.StatusGatewayTimeout, errorResponse("timeout", "request timed out"))
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				s.refundReservedBalance(pr, "provider_timeout:"+pr.RequestID)
+				s.updateInferenceRouteOutcomeForPending(pr, preResponseTimeoutOutcome(pr, "response_timeout_before_response"))
+				writeJSON(w, http.StatusGatewayTimeout, errorResponse("timeout", "request timed out"))
+			} else {
+				s.refundReservedBalance(pr, "client_gone:"+pr.RequestID)
+				s.updateInferenceRouteOutcomeForPending(pr, clientGoneBeforeResponseOutcome(pr))
+			}
 			return
 		}
 	}
@@ -4427,6 +4462,8 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 // It reads the raw request body, extracts model/stream, sets the endpoint field,
 // and reuses the same E2E encryption + provider routing as chat completions.
 func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, endpoint string) {
+	timing := &registry.RequestTiming{ReceivedAt: time.Now()}
+
 	// Shared prelude: read body, normalize tool schemas (Anthropic /v1/messages
 	// bodies carry a top-level "tools" array too; the provider body is rebuilt
 	// from parsed below, so normalizing before the unmarshal covers it), parse,
@@ -4525,6 +4562,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	billingPromptTokens := estimateBillingPromptTokens(parsed)
 	requestedMaxTokens := estimateRequestedMaxTokens(parsed)
 	genericDeadline := ttftDeadline(estimatedPromptTokens)
+	timing.ParsedAt = time.Now()
 
 	// Inject the endpoint so the provider knows which local path to forward to.
 	parsed["endpoint"] = endpoint
@@ -4599,6 +4637,38 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		if reservedMicroUSD > 0 {
 			s.releaseInitialReservation(consumerKey, model, reservedMicroUSD, serviceReservation)
 		}
+	}
+	timing.ReservedAt = time.Now()
+	rejectionForGeneric := func(stage, reason string, status, retryAfterMs int) rejectionInfo {
+		return rejectionInfo{
+			r:                     r,
+			stage:                 stage,
+			reasonCode:            reason,
+			httpStatus:            status,
+			keyID:                 keyIDFromContext(r.Context()),
+			consumerKeyHash:       store.HashKey(consumerKey),
+			requestedModel:        publicModel,
+			resolvedModel:         model,
+			stream:                stream,
+			estimatedPromptTokens: estimatedPromptTokens,
+			requestedMaxTokens:    requestedMaxTokens,
+			requiresVision:        requiresVision,
+			hasTools:              hasTools,
+			selfRouteOnly:         policy.enabled,
+			preferOwner:           policy.prefer,
+			params:                rejectionSamplingParams(parsed),
+			retryAfterMs:          retryAfterMs,
+		}
+	}
+	rejectionForGenericWithDecision := func(stage, reason string, status, retryAfterMs int, decision registry.RoutingDecision) rejectionInfo {
+		info := rejectionForGeneric(stage, reason, status, retryAfterMs)
+		info.servabilityComputed = true
+		info.candidateCount = decision.CandidateCount
+		info.capacityRejections = decision.CapacityRejections
+		info.modelTooLargeRejections = decision.ModelTooLargeRejections
+		info.visionRejections = decision.VisionRejections
+		info.bestTTFTMs = decision.BestTTFTMs
+		return info
 	}
 
 	// Self-route pre-flight (precise errors, no paid fallback); otherwise the
@@ -4817,6 +4887,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		ChunkCh:              make(chan string, chunkBufferSize),
 		CompleteCh:           make(chan protocol.UsageInfo, 1),
 		ErrorCh:              make(chan protocol.InferenceErrorMessage, 1),
+		Timing:               timing,
 	}
 
 	// Public inference routes (not self-route / prefer-owner) enforce the
@@ -4921,11 +4992,13 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			Pending:    pr,
 			ResponseCh: make(chan *registry.Provider, 1),
 		}
+		timing.QueuedAt = time.Now()
 		if err := s.registry.Queue().Enqueue(queuedReq); err != nil {
 			retryAfter := s.estimateRetryAfter(model)
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 			refundReservation()
 			s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:over_capacity"})
+			s.recordRejection(rejectionForGenericWithDecision("queue", "queue_full", http.StatusTooManyRequests, retryAfter*1000, decision))
 			if policy.enabled {
 				writeJSON(w, http.StatusTooManyRequests, errorResponse("machine_busy",
 					"your machine is at capacity — retry shortly", withCode("machine_busy")))
@@ -4942,17 +5015,38 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		// heartbeat, so the queued request drains onto it sooner.
 		s.kickColdDispatch(model)
 		s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:queued"})
+		routeState := &dispatchState{
+			s:                     s,
+			r:                     r,
+			model:                 model,
+			publicModel:           publicModel,
+			consumerKey:           consumerKey,
+			consumerLocation:      consumerLocation,
+			estimatedPromptTokens: estimatedPromptTokens,
+			requestedMaxTokens:    requestedMaxTokens,
+			requiresVision:        requiresVision,
+			hasTools:              hasTools,
+			policy:                policy,
+			cacheAffinityKey:      cacheAffinityKey,
+			requestID:             requestID,
+			attempt:               pr.Attempt,
+			pr:                    pr,
+		}
+		routeState.recordRoutingDecisionFor(nil, pr, requestID, pr.Attempt, decision, "", "queued")
 		provider, err = s.registry.Queue().WaitForProviderContext(r.Context(), queuedReq)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				s.recordWarmPoolQueueState(model)
+				s.updateInferenceRouteOutcomeForPending(pr, pendingRouteOutcome(pr, "cancelled", "client_gone", 0))
 				refundReservation()
 				return
 			}
+			s.updateInferenceRouteOutcomeForPending(pr, pendingRouteOutcome(pr, "timeout", "queue_timeout", http.StatusTooManyRequests))
 			retryAfter := s.estimateRetryAfter(model)
 			s.registry.RecordWarmPoolQueueTimeout(model, time.Since(queuedReq.EnqueuedAt))
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 			refundReservation()
+			s.recordRejection(rejectionForGenericWithDecision("queue", "queue_timeout", http.StatusTooManyRequests, retryAfter*1000, decision))
 			if policy.enabled {
 				writeJSON(w, http.StatusTooManyRequests, errorResponse("machine_busy",
 					"your machine is at capacity (timed out waiting for a free slot) — retry shortly", withCode("machine_busy")))
@@ -4966,12 +5060,32 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		s.recordWarmPoolQueueState(model)
 		decision = queuedReq.Decision
 	}
+	timing.RoutedAt = time.Now()
 	s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:selected"})
 	s.ddIncr("routing.provider_selected", []string{"provider_id:" + provider.ID, "model:" + model})
 	s.ddHistogram("routing.cost_ms", decision.CostMs, []string{"model:" + model, "provider_id:" + provider.ID})
 	if decision.EffectiveTPS > 0 {
 		s.ddGauge("routing.effective_decode_tps", decision.EffectiveTPS, []string{"provider_id:" + provider.ID})
 	}
+	routeState := &dispatchState{
+		s:                     s,
+		r:                     r,
+		model:                 model,
+		publicModel:           publicModel,
+		consumerKey:           consumerKey,
+		consumerLocation:      consumerLocation,
+		estimatedPromptTokens: estimatedPromptTokens,
+		requestedMaxTokens:    requestedMaxTokens,
+		requiresVision:        requiresVision,
+		hasTools:              hasTools,
+		policy:                policy,
+		cacheAffinityKey:      cacheAffinityKey,
+		requestID:             requestID,
+		attempt:               pr.Attempt,
+		provider:              provider,
+		pr:                    pr,
+	}
+	routeState.recordRoutingDecisionFor(provider, pr, requestID, pr.Attempt, decision, "", "")
 	pendingCleanup := true
 	cleanupPending := func() {
 		if pendingCleanup {
@@ -5021,7 +5135,11 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 					"your balance is too low for this provider price — add funds at /billing or lower max_tokens", withCode("insufficient_quota")))
 			} else {
 				s.logger.Error("provider reservation failed (DB error)", "consumer_key", consumerKey, "error", err)
+				s.updateInferenceRouteOutcomeForPending(pr, dispatchFailedPendingRouteOutcome(pr, "provider_error", http.StatusServiceUnavailable))
 				s.writeServiceUnavailable(w, model)
+			}
+			if errors.Is(err, store.ErrInsufficientBalance) {
+				s.updateInferenceRouteOutcomeForPending(pr, dispatchFailedPendingRouteOutcome(pr, "insufficient_funds", http.StatusPaymentRequired))
 			}
 			return
 		}
@@ -5038,6 +5156,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		cleanupPending()
 		refundExtra()
 		refundReservation()
+		s.updateInferenceRouteOutcomeForPending(pr, dispatchFailedPendingRouteOutcome(pr, "payload_too_large", http.StatusRequestEntityTooLarge))
 		s.recordRejection(rejectionInfo{
 			r:                     r,
 			stage:                 "validation",
@@ -5064,6 +5183,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		cleanupPending()
 		refundExtra()
 		refundReservation()
+		s.updateInferenceRouteOutcomeForPending(pr, dispatchFailedPendingRouteOutcome(pr, "encryption_missing", http.StatusServiceUnavailable))
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse("encryption_required",
 			"no provider with E2E encryption available"))
 		return
@@ -5074,6 +5194,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		cleanupPending()
 		refundExtra()
 		refundReservation()
+		s.updateInferenceRouteOutcomeForPending(pr, dispatchFailedPendingRouteOutcome(pr, "encryption_error", http.StatusInternalServerError))
 		writeJSON(w, http.StatusInternalServerError, errorResponse("encryption_error", "provider public key invalid"))
 		return
 	}
@@ -5083,6 +5204,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		cleanupPending()
 		refundExtra()
 		refundReservation()
+		s.updateInferenceRouteOutcomeForPending(pr, dispatchFailedPendingRouteOutcome(pr, "encryption_error", http.StatusInternalServerError))
 		writeJSON(w, http.StatusInternalServerError, errorResponse("encryption_error", "failed to generate session keys"))
 		return
 	}
@@ -5095,9 +5217,11 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		cleanupPending()
 		refundExtra()
 		refundReservation()
+		s.updateInferenceRouteOutcomeForPending(pr, dispatchFailedPendingRouteOutcome(pr, "encryption_error", http.StatusInternalServerError))
 		writeJSON(w, http.StatusInternalServerError, errorResponse("encryption_error", "failed to encrypt request"))
 		return
 	}
+	timing.EncryptedAt = time.Now()
 
 	wireMsg := map[string]any{
 		"type":       protocol.TypeInferenceRequest,
@@ -5109,12 +5233,13 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	}
 
 	pr.SessionPrivKey = &sessionKeys.PrivateKey
-
 	data, _ := json.Marshal(wireMsg)
+	timing.DispatchedAt = time.Now()
 	if err := provider.Conn.Write(r.Context(), websocket.MessageText, data); err != nil {
 		cleanupPending()
 		refundExtra()
 		refundReservation()
+		s.updateInferenceRouteOutcomeForPending(pr, dispatchFailedPendingRouteOutcome(pr, "provider_error", http.StatusBadGateway))
 		writeJSON(w, http.StatusBadGateway, errorResponse("provider_error", "failed to send request to provider"))
 		return
 	}
@@ -5145,6 +5270,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		ttftTimer.Stop()
 		if ok {
 			firstChunk = chunk
+			pr.MarkFirstChunkArrived()
 			committed = true
 		} else {
 			select {
@@ -5155,6 +5281,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 				refundExtra()
 				refundReservation()
 				s.noteInferenceError(provider.ID, pr, errMsg.StatusCode)
+				s.updateInferenceRouteOutcomeForPending(pr, preCommitProviderErrorOutcome(pr, errMsg))
 				statusCode := errMsg.StatusCode
 				if statusCode == 0 {
 					statusCode = http.StatusBadGateway
@@ -5173,6 +5300,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		refundExtra()
 		refundReservation()
 		s.noteInferenceError(provider.ID, pr, errMsg.StatusCode)
+		s.updateInferenceRouteOutcomeForPending(pr, preCommitProviderErrorOutcome(pr, errMsg))
 		statusCode := errMsg.StatusCode
 		if statusCode == 0 {
 			statusCode = http.StatusBadGateway
@@ -5186,6 +5314,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		refundExtra()
 		refundReservation()
 		s.ddIncr("inference.dispatches", []string{"status:timeout"})
+		s.updateInferenceRouteOutcomeForPending(pr, pendingRouteOutcome(pr, "timeout", "first_chunk_timeout", http.StatusGatewayTimeout))
 		writeJSON(w, http.StatusGatewayTimeout, errorResponse("timeout", "provider did not respond within TTFT deadline"))
 		return
 	case <-r.Context().Done():
@@ -5195,6 +5324,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		s.sendProviderCancel(provider, requestID)
 		refundExtra()
 		refundReservation()
+		s.updateInferenceRouteOutcomeForPending(pr, pendingRouteOutcome(pr, "cancelled", "client_gone", 0))
 		return
 	}
 
@@ -5206,6 +5336,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			chunkTimer.Stop()
 			if ok {
 				firstChunk = chunk
+				pr.MarkFirstChunkArrived()
 				committed = true
 			} else {
 				select {
@@ -5216,6 +5347,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 					refundExtra()
 					refundReservation()
 					s.noteInferenceError(provider.ID, pr, errMsg.StatusCode)
+					s.updateInferenceRouteOutcomeForPending(pr, preCommitProviderErrorOutcome(pr, errMsg))
 					statusCode := errMsg.StatusCode
 					if statusCode == 0 {
 						statusCode = http.StatusBadGateway
@@ -5234,6 +5366,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			refundExtra()
 			refundReservation()
 			s.noteInferenceError(provider.ID, pr, errMsg.StatusCode)
+			s.updateInferenceRouteOutcomeForPending(pr, preCommitProviderErrorOutcome(pr, errMsg))
 			statusCode := errMsg.StatusCode
 			if statusCode == 0 {
 				statusCode = http.StatusBadGateway
@@ -5251,6 +5384,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			// stalls must still accumulate into the routing cooldown).
 			s.noteInferenceError(provider.ID, pr, http.StatusGatewayTimeout)
 			s.ddIncr("inference.dispatches", []string{"status:timeout"})
+			s.updateInferenceRouteOutcomeForPending(pr, pendingRouteOutcome(pr, "timeout", "accepted_timeout", http.StatusGatewayTimeout))
 			writeJSON(w, http.StatusGatewayTimeout, errorResponse("timeout", "provider accepted but timed out before first chunk"))
 			return
 		case <-r.Context().Done():
@@ -5260,6 +5394,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			s.sendProviderCancel(provider, requestID)
 			refundExtra()
 			refundReservation()
+			s.updateInferenceRouteOutcomeForPending(pr, pendingRouteOutcome(pr, "cancelled", "client_gone", 0))
 			return
 		}
 	}
@@ -5270,9 +5405,11 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		s.sendProviderCancel(provider, requestID)
 		refundExtra()
 		refundReservation()
+		s.updateInferenceRouteOutcomeForPending(pr, providerFailedPendingRouteOutcome(pr, "error", "provider_incomplete", http.StatusServiceUnavailable))
 		writeJSON(w, http.StatusServiceUnavailable, errorResponse("provider_error", "failed to get first chunk from provider"))
 		return
 	}
+	s.updateInferenceRouteOutcomeForPending(pr, committedRouteOutcome(pr))
 
 	// Free the slot, stop the provider, and preserve billing on a mid-stream
 	// disconnect (park-before-remove + post-terminal sweep; see the
