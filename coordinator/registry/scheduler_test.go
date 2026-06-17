@@ -1615,6 +1615,126 @@ func TestFreeMemoryAdmitsFallsBackWithoutBudget(t *testing.T) {
 	}
 }
 
+// When the provider reports freeForLoadGB, the cold-load gate uses it as the
+// single source of truth: admit iff the model's weights fit, regardless of the
+// coarse total-memory heuristic.
+func TestFreeMemoryAdmitsColdLoadUsesReportedFreeForLoad(t *testing.T) {
+	freeForLoad := 9.0 // e.g. a 24GB box reports ~9GB loadable
+	base := routingSnapshot{
+		totalMemoryGB:   64, // heuristic would happily admit; reported value must win
+		availableOnDisk: true,
+		modelLoaded:     false,
+		totalPending:    0,
+		freeForLoadGB:   &freeForLoad,
+	}
+
+	fits := base
+	fits.modelSizeGB = 8 // 8 <= 9 → admit
+	if !freeMemoryAdmits(fits, 100, 256) {
+		t.Fatal("8GB model must be admitted: fits in reported 9GB free-for-load")
+	}
+
+	tooBig := base
+	tooBig.modelSizeGB = 14 // 14 > 9 → reject, even though heuristic on 64GB would admit
+	if freeMemoryAdmits(tooBig, 100, 256) {
+		t.Fatal("14GB model must be rejected: exceeds reported 9GB free-for-load")
+	}
+}
+
+// A reported 0 ("can't load anything now") must reject any cold load, not fall
+// back to the heuristic (nil is the only fallback trigger).
+func TestFreeMemoryAdmitsColdLoadReportedZeroRejects(t *testing.T) {
+	zero := 0.0
+	snap := routingSnapshot{
+		modelSizeGB:     4,
+		totalMemoryGB:   64,
+		availableOnDisk: true,
+		modelLoaded:     false,
+		totalPending:    0,
+		freeForLoadGB:   &zero,
+	}
+	if freeMemoryAdmits(snap, 100, 256) {
+		t.Fatal("reported free-for-load 0 must reject a cold load")
+	}
+}
+
+// The cold-load gate must compare against the provider's PADDED-GiB load basis,
+// not the raw catalog size, or a near-threshold model whose raw size fits but
+// whose padded estimate doesn't gets routed and then 503'd at load (Codex #390).
+func TestFreeMemoryAdmitsColdLoadNormalizesCatalogSize(t *testing.T) {
+	free := 10.0
+	// Raw 9.5GB naively "fits" 10, but padded 9.5*1.1176≈10.6 > 10 → must reject.
+	snap := routingSnapshot{
+		modelSizeGB:     9.5,
+		totalMemoryGB:   64,
+		availableOnDisk: true,
+		modelLoaded:     false,
+		totalPending:    0,
+		freeForLoadGB:   &free,
+	}
+	if freeMemoryAdmits(snap, 100, 256) {
+		t.Fatal("near-threshold model must reject: padded estimate exceeds reported free-for-load")
+	}
+	snap.modelSizeGB = 8 // padded 8*1.1176≈8.94 <= 10 → admit
+	if !freeMemoryAdmits(snap, 100, 256) {
+		t.Fatal("8GB model must admit: padded estimate fits reported free-for-load")
+	}
+}
+
+// The cold-load *planner* (modelLoadCandidatePendingLocked, used by warm-pool /
+// queue-before-shed) must also respect free_for_load_gb, so it never sends a
+// load_model the direct gate would reject (Codex #390 P2). Mirrors the direct path.
+func TestModelLoadCandidateRespectsFreeForLoad(t *testing.T) {
+	reg := New(testLogger())
+	const model = "free-for-load-planner"
+	reg.SetModelCatalog([]CatalogEntry{{ID: model, SizeGB: 14}})
+
+	p := registerProviderWithModel(reg, "p1", model)
+	makeProviderRoutable(p)
+	p.mu.Lock()
+	p.Hardware.MemoryGB = 64 // passes the static hardware gate
+	p.mu.Unlock()
+	now := time.Now()
+
+	setFFL := func(v *float64) {
+		p.mu.Lock()
+		p.BackendCapacity = &protocol.BackendCapacity{TotalMemoryGB: 64, FreeForLoadGB: v}
+		p.mu.Unlock()
+	}
+
+	low := 9.0
+	setFFL(&low)
+	if _, ok := reg.modelLoadCandidatePendingLocked(p, model, now); ok {
+		t.Fatal("planner must reject a 14GB model when the provider reports 9GB free-for-load")
+	}
+
+	high := 20.0
+	setFFL(&high)
+	if _, ok := reg.modelLoadCandidatePendingLocked(p, model, now); !ok {
+		t.Fatal("planner must accept a 14GB model when the provider reports 20GB free-for-load")
+	}
+
+	setFFL(nil) // legacy provider → fall back to the static hardware gate (64GB box)
+	if _, ok := reg.modelLoadCandidatePendingLocked(p, model, now); !ok {
+		t.Fatal("legacy provider (no free-for-load) must fall back to the static hardware gate")
+	}
+}
+
+// Legacy provider (freeForLoadGB nil) falls back to the total-memory heuristic.
+func TestFreeMemoryAdmitsColdLoadFallsBackWhenUnreported(t *testing.T) {
+	snap := routingSnapshot{
+		modelSizeGB:     16,
+		totalMemoryGB:   64, // 16 + ~0 + 4 = 20 <= 64 → admit via heuristic
+		availableOnDisk: true,
+		modelLoaded:     false,
+		totalPending:    0,
+		freeForLoadGB:   nil,
+	}
+	if !freeMemoryAdmits(snap, 100, 256) {
+		t.Fatal("legacy provider must fall back to the total-memory heuristic (admit)")
+	}
+}
+
 func TestSlotHeadroomWithExhaustedTokenBudgetRejectsCapacity(t *testing.T) {
 	reg := New(testLogger())
 	model := "budget-headroom-model"

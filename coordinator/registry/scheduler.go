@@ -80,10 +80,15 @@ type routingSnapshot struct {
 	systemMetrics      protocol.SystemMetrics
 	gpuMemoryActiveGB  float64
 	totalMemoryGB      float64
-	modelSizeGB        float64 // catalog-reported weight footprint (0 = unknown, gate disabled)
-	minRAMGb           int     // catalog authoritative min RAM (GB) to run the model (0 = unknown)
-	modelLoaded        bool    // true when the requested model is resident (running or idle)
-	availableOnDisk    bool    // model is in provider's Models list but not currently loaded
+	// freeForLoadGB is the provider-reported max additional model-weight (GB) it
+	// can load right now (net of cap/reserve/headroom, idle models reclaimed).
+	// When non-nil it is the authoritative cold-load gate; nil = legacy provider
+	// (fall back to the total-memory heuristic). See protocol.BackendCapacity.
+	freeForLoadGB   *float64
+	modelSizeGB     float64 // catalog-reported weight footprint (0 = unknown, gate disabled)
+	minRAMGb        int     // catalog authoritative min RAM (GB) to run the model (0 = unknown)
+	modelLoaded     bool    // true when the requested model is resident (running or idle)
+	availableOnDisk bool    // model is in provider's Models list but not currently loaded
 
 	observedDecodeTPS     float64
 	observedPrefillTPS    float64 // measured per-slot prefill EWMA; 0 = unreported (fall back to prefillTPS chain)
@@ -780,6 +785,7 @@ func (r *Registry) snapshotProviderLocked(p *Provider, model string, traits Requ
 
 	if p.BackendCapacity != nil {
 		snap.gpuMemoryActiveGB = p.BackendCapacity.GPUMemoryActiveGB
+		snap.freeForLoadGB = p.BackendCapacity.FreeForLoadGB
 		if p.BackendCapacity.TotalMemoryGB > 0 {
 			snap.totalMemoryGB = p.BackendCapacity.TotalMemoryGB
 		}
@@ -804,6 +810,42 @@ func (r *Registry) snapshotProviderLocked(p *Provider, model string, traits Requ
 	snap.fleetMedianTPS = r.tpsRegistry.Median(model, p.Hardware.ChipFamily)
 
 	return snap, true
+}
+
+// coldLoadCatalogGBToMemGiB converts a model's catalog on-disk size (decimal GB,
+// TotalSizeBytes/1e9, unpadded) into the provider's load-gate basis (padded GiB).
+// The provider's ModelLoadAdmission.canLoad weighs estimatedMemoryGb = on-disk
+// bytes × 1.2 (scanner memory-overhead) / 2^30, and free_for_load_gb is reported
+// in that same padded-GiB basis. So a raw catalog size must be padded+converted
+// the same way before comparing, or a near-threshold model whose RAW size fits
+// but whose PADDED estimate doesn't would be admitted here and then 503'd at load
+// (Codex #390). 1.2 mirrors the provider scanner's overhead factor; (1e9/2^30)
+// converts decimal GB → GiB. Conservative: if the scanner's factor ever drops,
+// this stays safe (slightly stricter); it must not be set BELOW the provider's.
+const coldLoadCatalogGBToMemGiB = 1.2 * (1e9 / float64(int64(1)<<30)) // ≈ 1.1176
+
+// backendFreeForLoadGB returns the provider-reported free_for_load_gb (nil-safe).
+// Caller must hold the provider lock when passing p.BackendCapacity.
+func backendFreeForLoadGB(bc *protocol.BackendCapacity) *float64 {
+	if bc == nil {
+		return nil
+	}
+	return bc.FreeForLoadGB
+}
+
+// reportedFreeForLoadAdmits reports whether a cold load of a model with the given
+// catalog size (decimal GB) fits the provider's reported free_for_load_gb (max
+// loadable model weight, padded GiB — the provider's authoritative gate). The
+// second return is whether the provider reported the value at all; false means
+// the caller should fall back to its static hardware heuristic (legacy provider,
+// or unknown catalog size that can't be normalized). Used by every cold-load
+// decision path (direct admission, the swap planner, the warm pool, and the
+// cold-spill predicate) so they cannot drift.
+func reportedFreeForLoadAdmits(catalogSizeGB float64, freeForLoadGB *float64) (admit bool, reported bool) {
+	if freeForLoadGB == nil || catalogSizeGB <= 0 {
+		return false, false
+	}
+	return catalogSizeGB*coldLoadCatalogGBToMemGiB <= *freeForLoadGB, true
 }
 
 // freeMemoryAdmits returns true when the provider has enough headroom.
@@ -842,16 +884,28 @@ func freeMemoryAdmits(snap routingSnapshot, reqPromptTokens, reqMaxTokens int) b
 	required += kvCacheGB
 
 	// When the model is available on disk but not currently loaded, the
-	// provider will evict idle models to make room (LRU eviction). Check
-	// whether the model individually fits in total memory (with OS/KV
-	// overhead) rather than requiring it to fit alongside existing loaded
-	// models. The provider handles the swap autonomously.
+	// provider will evict idle models to make room (LRU eviction), so we check
+	// whether the model can be loaded rather than requiring it to fit alongside
+	// existing loaded models. The provider handles the swap autonomously.
 	//
-	// However, if the provider has in-flight requests (totalPending > 0),
-	// it cannot evict the currently-serving model. In that case, fall
-	// through to the standard free-memory check which requires room
-	// alongside active models.
+	// However, if the provider has in-flight requests (totalPending > 0), it
+	// cannot evict the currently-serving model. In that case, fall through to the
+	// standard free-memory check which requires room alongside active models.
 	if snap.availableOnDisk && !snap.modelLoaded && snap.totalPending == 0 {
+		// Preferred: the provider reports freeForLoadGB — the max model WEIGHT it
+		// can load right now, already net of the 90% unified cap, OS/operator
+		// reserve, activation+min-KV headroom, real OS-available memory, and
+		// eviction of idle models. The single source of truth, normalized to the
+		// provider's padded-GiB load basis so it exactly mirrors the provider's own
+		// ModelLoadAdmission gate (no over-admit → OOM, no under-admit on evictable
+		// weights).
+		if admit, reported := reportedFreeForLoadAdmits(snap.modelSizeGB, snap.freeForLoadGB); reported {
+			return admit
+		}
+		// Fallback for legacy providers that don't report freeForLoadGB: the old
+		// total-memory heuristic (provider evicts idle models, so compare against
+		// total rather than free). Coarser — can't see the unified cap or OS
+		// baseline — but only used until the fleet reports the field.
 		const osReserveGB = 4.0
 		return snap.modelSizeGB+kvCacheGB+osReserveGB <= snap.totalMemoryGB
 	}
@@ -1354,6 +1408,7 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 		}
 		if snap.hasBackendCapacity {
 			snap.gpuMemoryActiveGB = p.BackendCapacity.GPUMemoryActiveGB
+			snap.freeForLoadGB = p.BackendCapacity.FreeForLoadGB
 			if p.BackendCapacity.TotalMemoryGB > 0 {
 				snap.totalMemoryGB = p.BackendCapacity.TotalMemoryGB
 			}

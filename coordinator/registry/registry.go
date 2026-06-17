@@ -2074,6 +2074,18 @@ func clampBackendCapacity(logger *slog.Logger, providerID string, bc *protocol.B
 	if v, changed := clampNonNeg(bc.GPUMemoryCacheGB, maxMemoryGBFloat); changed {
 		bc.GPUMemoryCacheGB = v
 	}
+	// free_for_load_gb: an out-of-range value (NaN/Inf/negative or absurdly high)
+	// is treated as NOT reported (nil) so the cold-load gate falls back to the
+	// total-memory heuristic, rather than trusting a garbage value that would
+	// over- or under-admit. A legitimate 0 ("can't load anything now") is kept.
+	if bc.FreeForLoadGB != nil {
+		v := *bc.FreeForLoadGB
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > maxMemoryGBFloat {
+			logger.Warn("provider free_for_load_gb out of range; ignoring (fall back to heuristic)",
+				"provider_id", providerID, "reported", v)
+			bc.FreeForLoadGB = nil
+		}
+	}
 	for i := range bc.Slots {
 		s := &bc.Slots[i]
 		if s.MaxTokensPotential < 0 || s.MaxTokensPotential > maxTokensPotential {
@@ -2861,6 +2873,14 @@ func (r *Registry) modelLoadCandidatePendingLocked(p *Provider, model string, no
 	// multiple that would exclude catalog-qualified nodes.
 	if entry, ok := r.modelCatalog[model]; ok && (entry.MinRAMGB > 0 || entry.SizeGB > 0) {
 		if !modelFitsHardware(entry.MinRAMGB, entry.SizeGB, float64(p.Hardware.MemoryGB)) {
+			return 0, false
+		}
+		// Live free-capacity gate (shared helper with the direct path): don't plan
+		// a load the provider already reports it cannot fit. Mirrors freeMemoryAdmits
+		// so the warming planner can't send a load_model the provider then
+		// OOM-rejects, which would leave queued cold-dispatch requests sitting until
+		// they time out. Legacy providers (no report) fall through to the static gate.
+		if admit, reported := reportedFreeForLoadAdmits(entry.SizeGB, backendFreeForLoadGB(p.BackendCapacity)); reported && !admit {
 			return 0, false
 		}
 	}
