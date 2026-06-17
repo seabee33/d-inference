@@ -188,6 +188,19 @@ type HeartbeatMessage struct {
 	WarmModels      []string         `json:"warm_models,omitempty"`      // models currently loaded in memory
 	SystemMetrics   SystemMetrics    `json:"system_metrics"`             // live resource utilization
 	BackendCapacity *BackendCapacity `json:"backend_capacity,omitempty"` // live backend capacity (nil for old providers)
+
+	// APNs code-identity attestation (W5 Fix 2): a provider that only obtained
+	// its APNs device token AFTER registration (headless/late-token Mac) — or
+	// whose token rotated mid-connection — carries it here so the coordinator can
+	// re-arm a code-identity challenge WITHOUT forcing a reconnect. Mirrors
+	// RegisterMessage.APNsDeviceToken/APNsEnvironment. omitempty so providers that
+	// never have a token (and the steady state) keep the wire shape unchanged; nil
+	// when absent. SECURITY: the token here only lets the coordinator SEND a
+	// challenge — it NEVER by itself grants CodeAttested. Attestation still
+	// requires the full E_K(nonce) round-trip verified against the SE key bound at
+	// registration (see api.handleCodeAttestationResponse).
+	APNsDeviceToken string `json:"apns_device_token,omitempty"` // hex device token from registerForRemoteNotifications
+	APNsEnvironment string `json:"apns_environment,omitempty"`  // "production" | "development" (selects the APNs host)
 }
 
 // BackendSlotCapacity describes the capacity state of a single backend slot
@@ -202,10 +215,12 @@ type BackendSlotCapacity struct {
 	MaxTokensPotential int64  `json:"max_tokens_potential"`      // sum of max_tokens across running requests (worst-case growth)
 
 	ObservedDecodeTPS     float64 `json:"observed_decode_tps,omitempty"`      // EWMA of measured per-request decode TPS
+	ObservedPrefillTPS    float64 `json:"observed_prefill_tps,omitempty"`     // EWMA of measured per-request prefill TPS (admission→first token); omitted when unmeasured
 	ActiveTokenBudgetUsed int64   `json:"active_token_budget_used,omitempty"` // tokens reserved by active requests (prompt + max_output)
 	ActiveTokenBudgetMax  int64   `json:"active_token_budget_max,omitempty"`  // maximum token budget for this slot
 	QueuedTokenBudget     int64   `json:"queued_token_budget,omitempty"`      // tokens reserved by queued requests
 	KVBytesPerToken       int64   `json:"kv_bytes_per_token,omitempty"`       // per-token KV cache memory cost in bytes (provider-side only)
+	ModelLoadTimeMS       int64   `json:"model_load_time_ms,omitempty"`       // measured cold-start load time (ms) for the model in this slot; omitted when unmeasured
 }
 
 // BackendCapacity describes the aggregate capacity across all backend slots

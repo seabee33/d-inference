@@ -148,6 +148,13 @@ type PendingRequest struct {
 	// <= MaxTTFTMs. Used by public inference routes to honor the public
 	// TTFT target. Self-route / prefer-owner requests leave this at 0.
 	MaxTTFTMs float64
+	// MinDecodeTPS is an optional per-request sustained-decode floor in tokens/sec
+	// (Routing v2 W2). When > 0, the scheduler PREFERS providers that would still
+	// deliver >= MinDecodeTPS to a newly admitted request (i.e. not overpack a
+	// provider into a degraded stream). It is a SOFT preference: if no candidate
+	// meets the floor, the full pool is kept so the request is still served
+	// (cold-dispatch/queue spill is a separate concern). 0 disables it.
+	MinDecodeTPS float64
 	// CacheAffinityKey is SHA256(prompt_cache_key) from the request body. Empty
 	// means no cache-affinity routing. It is scoped again by account and model in
 	// the registry tracker and is never persisted.
@@ -2027,6 +2034,7 @@ const (
 	maxReportedMaxConcurrency       = 24
 	maxTokensPotential              = 1_000_000
 	maxTokenBudgetCap         int64 = 10_000_000_000 // 10 billion — generous safety valve for total token budget capacity
+	maxModelLoadTimeMS        int64 = 3_600_000      // 1 hour — generous ceiling for a cold-start model load; larger is implausible/garbage
 )
 
 // clampNonNeg returns v clamped into [0, max]; NaN/negative become 0.
@@ -2096,6 +2104,20 @@ func clampBackendCapacity(logger *slog.Logger, providerID string, bc *protocol.B
 			logger.Warn("provider slot observed_decode_tps out of range, clamping",
 				"provider_id", providerID, "model", s.Model, "reported", s.ObservedDecodeTPS, "clamped", v)
 			s.ObservedDecodeTPS = v
+		}
+		if v, changed := clampNonNeg(s.ObservedPrefillTPS, maxPrefillTPS); changed {
+			logger.Warn("provider slot observed_prefill_tps out of range, clamping",
+				"provider_id", providerID, "model", s.Model, "reported", s.ObservedPrefillTPS, "clamped", v)
+			s.ObservedPrefillTPS = v
+		}
+		if s.ModelLoadTimeMS < 0 || s.ModelLoadTimeMS > maxModelLoadTimeMS {
+			logger.Warn("provider slot model_load_time_ms out of range, clamping",
+				"provider_id", providerID, "model", s.Model, "reported", s.ModelLoadTimeMS)
+			if s.ModelLoadTimeMS < 0 {
+				s.ModelLoadTimeMS = 0
+			} else {
+				s.ModelLoadTimeMS = maxModelLoadTimeMS
+			}
 		}
 		if s.ActiveTokenBudgetUsed < 0 || s.ActiveTokenBudgetUsed > maxTokenBudgetCap {
 			if s.ActiveTokenBudgetUsed < 0 {
@@ -4259,6 +4281,12 @@ func (r *Registry) ModelCapacitySnapshot() []ModelCapacity {
 					}
 					if slot.ObservedDecodeTPS > 0 {
 						snap.effectiveTPS = slot.ObservedDecodeTPS
+					}
+					// Prefer the measured per-slot prefill EWMA over the ×12
+					// fallback for the capacity TTFT estimate, mirroring the
+					// routing path (resolvePrefillTPS). 0 = unreported.
+					if slot.ObservedPrefillTPS > 0 {
+						snap.prefillTPS = slot.ObservedPrefillTPS
 					}
 					snap.activeTokenBudgetMax = slot.ActiveTokenBudgetMax
 					snap.activeTokenBudgetUsed = slot.ActiveTokenBudgetUsed

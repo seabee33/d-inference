@@ -321,6 +321,48 @@ func TestHeartbeatMessageMarshal(t *testing.T) {
 	}
 }
 
+func TestHeartbeatMessageAPNsFieldsSymmetry(t *testing.T) {
+	// A heartbeat payload exactly as the Swift ProviderMessage encoder emits it
+	// once a late/changed APNs device token is carried in the heartbeat (W5 Fix 2).
+	swiftJSON := `{
+		"type": "heartbeat",
+		"status": "idle",
+		"active_model": null,
+		"stats": {"requests_served": 0, "tokens_generated": 0},
+		"system_metrics": {"memory_pressure": 0, "cpu_usage": 0, "thermal_state": "nominal"},
+		"apns_device_token": "cb1ceb489ec9",
+		"apns_environment": "production"
+	}`
+	var decoded HeartbeatMessage
+	if err := json.Unmarshal([]byte(swiftJSON), &decoded); err != nil {
+		t.Fatalf("unmarshal swift payload: %v", err)
+	}
+	if decoded.APNsDeviceToken != "cb1ceb489ec9" {
+		t.Errorf("apns_device_token did not decode: %q", decoded.APNsDeviceToken)
+	}
+	if decoded.APNsEnvironment != "production" {
+		t.Errorf("apns_environment did not decode: %q", decoded.APNsEnvironment)
+	}
+
+	// Both fields are omitempty: a token-less heartbeat (the steady state, and
+	// what the Swift encoder emits when nil) must NOT emit them, or the symmetry
+	// tests on the Swift side drift.
+	data, _ := json.Marshal(HeartbeatMessage{Type: TypeHeartbeat, Status: "idle"})
+	if contains(string(data), "apns_device_token") || contains(string(data), "apns_environment") {
+		t.Errorf("empty APNs heartbeat fields should be omitted, got %s", data)
+	}
+
+	// Round-trip with values.
+	data, _ = json.Marshal(HeartbeatMessage{Type: TypeHeartbeat, Status: "idle", APNsDeviceToken: "tok", APNsEnvironment: "development"})
+	var back HeartbeatMessage
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("round-trip unmarshal: %v", err)
+	}
+	if back.APNsDeviceToken != "tok" || back.APNsEnvironment != "development" {
+		t.Errorf("APNs heartbeat fields round-trip failed: %+v from %s", back, data)
+	}
+}
+
 func TestBackendSlotCapacityMaxConcurrencyRoundTrip(t *testing.T) {
 	msg := HeartbeatMessage{
 		Type:   TypeHeartbeat,
@@ -1152,9 +1194,11 @@ func TestBackendSlotCapacityTokenBudgetFields(t *testing.T) {
 		ActiveTokens:          5000,
 		MaxTokensPotential:    12000,
 		ObservedDecodeTPS:     85.5,
+		ObservedPrefillTPS:    412.0,
 		ActiveTokenBudgetUsed: 28000,
 		ActiveTokenBudgetMax:  32768,
 		QueuedTokenBudget:     4096,
+		ModelLoadTimeMS:       9300,
 	}
 
 	data, err := json.Marshal(slot)
@@ -1169,6 +1213,12 @@ func TestBackendSlotCapacityTokenBudgetFields(t *testing.T) {
 
 	if decoded.ObservedDecodeTPS != 85.5 {
 		t.Errorf("observed_decode_tps = %f, want 85.5", decoded.ObservedDecodeTPS)
+	}
+	if decoded.ObservedPrefillTPS != 412.0 {
+		t.Errorf("observed_prefill_tps = %f, want 412.0", decoded.ObservedPrefillTPS)
+	}
+	if decoded.ModelLoadTimeMS != 9300 {
+		t.Errorf("model_load_time_ms = %d, want 9300", decoded.ModelLoadTimeMS)
 	}
 	if decoded.ActiveTokenBudgetUsed != 28000 {
 		t.Errorf("active_token_budget_used = %d, want 28000", decoded.ActiveTokenBudgetUsed)
@@ -1196,7 +1246,7 @@ func TestBackendSlotCapacityOmitsZeroTokenBudget(t *testing.T) {
 	var m map[string]any
 	json.Unmarshal(data, &m)
 
-	for _, key := range []string{"observed_decode_tps", "active_token_budget_used", "active_token_budget_max", "queued_token_budget"} {
+	for _, key := range []string{"observed_decode_tps", "observed_prefill_tps", "active_token_budget_used", "active_token_budget_max", "queued_token_budget", "model_load_time_ms"} {
 		if _, ok := m[key]; ok {
 			t.Errorf("%s should be omitted when zero (omitempty)", key)
 		}
@@ -1213,6 +1263,12 @@ func TestBackendSlotCapacityBackwardCompatDecode(t *testing.T) {
 	}
 	if slot.ObservedDecodeTPS != 0 {
 		t.Errorf("observed_decode_tps = %f, want 0 (absent from JSON)", slot.ObservedDecodeTPS)
+	}
+	if slot.ObservedPrefillTPS != 0 {
+		t.Errorf("observed_prefill_tps = %f, want 0 (absent from JSON)", slot.ObservedPrefillTPS)
+	}
+	if slot.ModelLoadTimeMS != 0 {
+		t.Errorf("model_load_time_ms = %d, want 0 (absent from JSON)", slot.ModelLoadTimeMS)
 	}
 	if slot.ActiveTokenBudgetUsed != 0 {
 		t.Errorf("active_token_budget_used = %d, want 0", slot.ActiveTokenBudgetUsed)

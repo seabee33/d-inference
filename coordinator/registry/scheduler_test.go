@@ -216,6 +216,164 @@ func TestResolvedPrefillTPSFallbackRatio(t *testing.T) {
 	}
 }
 
+func TestResolvePrefillTPSPrefersObserved(t *testing.T) {
+	// No measured rate: the resolver returns the existing prefillTPS chain
+	// (resolvedPrefillTPS: benchmark → decode×12) unchanged. This is the
+	// today-fleet path and MUST be a no-op.
+	if got := resolvePrefillTPS(routingSnapshot{prefillTPS: 600}); got != 600 {
+		t.Fatalf("fallback prefill = %v, want 600 (×12 chain preserved)", got)
+	}
+	// A non-positive observed value is treated as unmeasured → fallback.
+	if got := resolvePrefillTPS(routingSnapshot{prefillTPS: 600, observedPrefillTPS: 0}); got != 600 {
+		t.Fatalf("zero observed prefill = %v, want 600 (fallback)", got)
+	}
+	// A measured per-slot prefill EWMA wins over the static chain.
+	if got := resolvePrefillTPS(routingSnapshot{prefillTPS: 600, observedPrefillTPS: 1800}); got != 1800 {
+		t.Fatalf("observed prefill = %v, want 1800 (measured preferred)", got)
+	}
+	// The result is clamped to maxPrefillTPS so one outlier heartbeat cannot
+	// collapse the TTFT estimate.
+	if got := resolvePrefillTPS(routingSnapshot{observedPrefillTPS: maxPrefillTPS * 2}); got != maxPrefillTPS {
+		t.Fatalf("clamped observed prefill = %v, want %v", got, maxPrefillTPS)
+	}
+}
+
+func TestTTFTMsFromSnapshotUsesObservedPrefillTPS(t *testing.T) {
+	const prompt = 1000
+	// Fallback path: no measured prefill → ttft uses snap.prefillTPS (the ×12
+	// chain), identical to the pre-wiring behavior. statePenalty(running)=0,
+	// queuedPrefill=0, firstDecode=1000/decode.
+	fallback := routingSnapshot{
+		hasBackendCapacity: true,
+		slotState:          "running",
+		prefillTPS:         600, // e.g. decode 50 × 12
+		decodeTPS:          50,
+	}
+	fallbackTTFT := ttftMsFromSnapshot(fallback, prompt)
+	wantFallback := float64(prompt)/600*1000 + 1000.0/50.0
+	if d := fallbackTTFT - wantFallback; d > 0.01 || d < -0.01 {
+		t.Fatalf("fallback TTFT = %.4f, want %.4f (×12 chain preserved)", fallbackTTFT, wantFallback)
+	}
+
+	// Measured path: a 3× faster observed prefill lowers only the prefill term.
+	observed := fallback
+	observed.observedPrefillTPS = 1800
+	observedTTFT := ttftMsFromSnapshot(observed, prompt)
+	wantObserved := float64(prompt)/1800*1000 + 1000.0/50.0
+	if d := observedTTFT - wantObserved; d > 0.01 || d < -0.01 {
+		t.Fatalf("observed TTFT = %.4f, want %.4f (measured prefill used)", observedTTFT, wantObserved)
+	}
+	if observedTTFT >= fallbackTTFT {
+		t.Fatalf("observed TTFT %.2f should be below fallback TTFT %.2f", observedTTFT, fallbackTTFT)
+	}
+}
+
+func TestQuickCapacityCheckTTFTUsesObservedPrefillTPS(t *testing.T) {
+	model := "ttft-observed-prefill-model"
+	const prompt = 4000
+
+	// Baseline provider: reports only the one-time registration prefill
+	// benchmark (PrefillTPS). prefill term = 4000/400 = 10s.
+	regBench := New(testLogger())
+	pBench := makeSchedulerProvider(t, regBench, "bench", model, 100)
+	pBench.mu.Lock()
+	pBench.PrefillTPS = 400
+	pBench.BackendCapacity.Slots[0].MaxConcurrency = 8
+	pBench.mu.Unlock()
+	_, _, _, benchTTFT, hasBench := regBench.QuickCapacityCheckWithTTFTForRequest(model, prompt, 128, RequestTraits{}, false)
+	if !hasBench {
+		t.Fatal("expected a TTFT estimate for the benchmark-only provider")
+	}
+	if benchTTFT <= 9*time.Second {
+		t.Fatalf("benchmark TTFT = %v, want ~10s from the ×?? benchmark prefill", benchTTFT)
+	}
+
+	// Same provider also reporting a measured prefill EWMA 4× the benchmark.
+	// prefill term = 4000/1600 = 2.5s, so the measured value must dominate and
+	// the estimate must drop well below the benchmark-only path.
+	regObs := New(testLogger())
+	pObs := makeSchedulerProvider(t, regObs, "observed", model, 100)
+	pObs.mu.Lock()
+	pObs.PrefillTPS = 400
+	pObs.BackendCapacity.Slots[0].MaxConcurrency = 8
+	pObs.BackendCapacity.Slots[0].ObservedPrefillTPS = 1600
+	pObs.mu.Unlock()
+	_, _, _, obsTTFT, hasObs := regObs.QuickCapacityCheckWithTTFTForRequest(model, prompt, 128, RequestTraits{}, false)
+	if !hasObs {
+		t.Fatal("expected a TTFT estimate for the observed-prefill provider")
+	}
+	if obsTTFT >= benchTTFT {
+		t.Fatalf("observed-prefill TTFT %v should be below benchmark-only TTFT %v", obsTTFT, benchTTFT)
+	}
+	if obsTTFT > 4*time.Second {
+		t.Fatalf("observed-prefill TTFT = %v, want ~2.5s from the measured prefill rate", obsTTFT)
+	}
+}
+
+func TestProjectedPerRequestDecodeTPS(t *testing.T) {
+	k := effectiveTPSLoadFactor
+	abs := func(x float64) float64 {
+		if x < 0 {
+			return -x
+		}
+		return x
+	}
+	approx := func(a, b float64) bool { return abs(a-b) < 0.01 }
+
+	// Static fallback (no observed rate), idle provider: rate at batch 1 = static/(1+k).
+	if got, want := projectedPerRequestDecodeTPS(routingSnapshot{decodeTPS: 25}), 25.0/(1+k); !approx(got, want) {
+		t.Fatalf("static idle projected = %.2f, want %.2f", got, want)
+	}
+	// Observed rate measured at batch 2 is unwound to a solo rate, then reapplied
+	// at batch 3 (the new request joins): solo = obs*(1+2k); proj = solo/(1+3k).
+	snap := routingSnapshot{decodeTPS: 25, observedDecodeTPS: 20, backendRunning: 2}
+	if got, want := projectedPerRequestDecodeTPS(snap), 20.0*(1+2*k)/(1+3*k); !approx(got, want) {
+		t.Fatalf("observed projected = %.2f, want %.2f", got, want)
+	}
+	// No decode info -> 0 (treated as below any positive floor).
+	if got := projectedPerRequestDecodeTPS(routingSnapshot{}); got != 0 {
+		t.Fatalf("empty snapshot projected = %.2f, want 0", got)
+	}
+}
+
+func TestReserveProviderDecodeFloorPrefersAboveFloor(t *testing.T) {
+	reg := New(testLogger())
+	model := "decode-floor-model"
+	idle := makeSchedulerProvider(t, reg, "idle", model, 30) // batch 0 -> projected ~23.6 (>= 15)
+	packed := makeSchedulerProvider(t, reg, "packed", model, 30)
+	packed.mu.Lock()
+	packed.BackendCapacity.Slots[0].NumRunning = 5        // batched (< maxConc, still a candidate)
+	packed.BackendCapacity.Slots[0].ObservedDecodeTPS = 8 // measured low under load -> projected < 15
+	packed.mu.Unlock()
+
+	req := &PendingRequest{RequestID: "floor-1", Model: model, EstimatedPromptTokens: 100, RequestedMaxTokens: 128, MinDecodeTPS: 15}
+	selected, decision := reg.ReserveProviderEx(model, req)
+	if selected == nil {
+		t.Fatalf("decode floor must not reject when a candidate exists: %+v", decision)
+	}
+	if selected.ID != idle.ID {
+		t.Fatalf("decode floor selected %q, want the above-floor idle provider", selected.ID)
+	}
+}
+
+func TestReserveProviderDecodeFloorNeverFailsClosed(t *testing.T) {
+	reg := New(testLogger())
+	model := "decode-floor-only-low"
+	only := makeSchedulerProvider(t, reg, "only", model, 20)
+	only.mu.Lock()
+	only.BackendCapacity.Slots[0].NumRunning = 5
+	only.BackendCapacity.Slots[0].ObservedDecodeTPS = 6 // projected well below the floor
+	only.mu.Unlock()
+
+	// Floor higher than any candidate can deliver: the gate is SOFT, so the
+	// request must still be served on the best-available provider, not rejected.
+	req := &PendingRequest{RequestID: "floor-2", Model: model, EstimatedPromptTokens: 100, RequestedMaxTokens: 128, MinDecodeTPS: 50}
+	selected, decision := reg.ReserveProviderEx(model, req)
+	if selected == nil {
+		t.Fatalf("decode floor is SOFT and must still serve the only (below-floor) provider: %+v", decision)
+	}
+}
+
 func TestReserveProviderExcludesSlowProviderWhenTTFTCeilingSet(t *testing.T) {
 	reg := New(testLogger())
 	model := "ttft-ceiling-model"

@@ -34,7 +34,7 @@ const (
 	thermalPenaltyFairMs     = 2_000.0
 	thermalPenaltySeriousMs  = 8_000.0
 	nearTieCostWindowMs      = 3_000.0
-	challengeFreshnessMaxAge = 6 * time.Minute
+	challengeFreshnessMaxAge = 16 * time.Minute
 
 	// kvCacheBytesPerToken is a per-token KV-cache size estimate used by
 	// the free-memory admission gate.
@@ -86,6 +86,7 @@ type routingSnapshot struct {
 	availableOnDisk    bool    // model is in provider's Models list but not currently loaded
 
 	observedDecodeTPS     float64
+	observedPrefillTPS    float64 // measured per-slot prefill EWMA; 0 = unreported (fall back to prefillTPS chain)
 	activeTokenBudgetUsed int64
 	activeTokenBudgetMax  int64
 	queuedTokenBudget     int64
@@ -477,6 +478,25 @@ func (r *Registry) selectBestCandidateLockedFull(model string, pr *PendingReques
 		}
 	}
 
+	// Decode-floor quality preference (SOFT, Routing v2 W2): when a per-request
+	// decode floor is set, prefer candidates that would still deliver
+	// >= MinDecodeTPS to a newly admitted request, so the router does not overpack
+	// a provider into a degraded (low tok/s) stream. Never fails closed — if no
+	// candidate clears the floor, keep the full pool so the request is still
+	// served (growing warm capacity / queueing to protect quality is handled
+	// upstream, not by dropping the request here).
+	if pr.MinDecodeTPS > 0 {
+		quality := make([]*routingCandidate, 0, len(pool))
+		for _, c := range pool {
+			if projectedPerRequestDecodeTPS(c.snapshot) >= pr.MinDecodeTPS {
+				quality = append(quality, c)
+			}
+		}
+		if len(quality) > 0 {
+			pool = quality
+		}
+	}
+
 	var best *routingCandidate
 	for _, c := range pool {
 		if best == nil || c.costMs < best.costMs {
@@ -772,6 +792,7 @@ func (r *Registry) snapshotProviderLocked(p *Provider, model string, traits Requ
 			snap.backendWaiting = int(slot.NumWaiting)
 			snap.maxTokensPotential = slot.MaxTokensPotential
 			snap.observedDecodeTPS = slot.ObservedDecodeTPS
+			snap.observedPrefillTPS = slot.ObservedPrefillTPS
 			snap.activeTokenBudgetUsed = slot.ActiveTokenBudgetUsed
 			snap.activeTokenBudgetMax = slot.ActiveTokenBudgetMax
 			snap.queuedTokenBudget = slot.QueuedTokenBudget
@@ -1039,6 +1060,26 @@ func resolveEffectiveTPS(snap routingSnapshot) float64 {
 	return effectiveDecodeTPS(snap.decodeTPS, snap.backendRunning)
 }
 
+// resolvePrefillTPS returns the best available prefill TPS estimate for TTFT.
+// Fallback chain: measured per-slot observed prefill EWMA → snap.prefillTPS (the
+// resolvedPrefillTPS chain: registration benchmark → decode×prefillToDecodeRatio
+// ×12 fallback). This mirrors how resolveEffectiveTPS prefers the measured
+// decode rate over the static estimate. The result is clamped to maxPrefillTPS
+// so a single outlier heartbeat cannot collapse the TTFT estimate.
+//
+// observedPrefillTPS stays 0 until providers ship the W1 measurement, so on
+// today's fleet this is a no-op that returns the existing ×12-chain value.
+func resolvePrefillTPS(snap routingSnapshot) float64 {
+	tps := snap.prefillTPS
+	if snap.observedPrefillTPS > 0 {
+		tps = snap.observedPrefillTPS
+	}
+	if tps > maxPrefillTPS {
+		tps = maxPrefillTPS
+	}
+	return tps
+}
+
 // effectiveDecodeTPS scales the static decode TPS down by current
 // backend batch size. Returns the static value when the load factor is
 // disabled or batch is unknown. Floored at 1 token/s to avoid divide-
@@ -1099,11 +1140,45 @@ func SetPrefillToDecodeRatio(ratio float64) {
 	}
 }
 
+// PrefillToDecodeRatio returns the current decode→prefill fallback multiplier
+// (the value used by resolvedPrefillTPS when a provider does not report a
+// measured prefill rate). Exposed for the routing simulation harness.
+func PrefillToDecodeRatio() float64 {
+	return prefillToDecodeRatio
+}
+
 func resolvedPrefillTPS(p *Provider) float64 {
 	if p.PrefillTPS > 0 {
 		return p.PrefillTPS
 	}
 	return resolvedDecodeTPS(p) * prefillToDecodeRatio
+}
+
+// projectedPerRequestDecodeTPS estimates the decode tokens/sec a NEWLY admitted
+// request would receive on this snapshot's provider once it joins the batch
+// (backendRunning+1 concurrent). Continuous batching is memory-bandwidth bound,
+// so per-request decode degrades with batch size by the same effectiveTPSLoadFactor
+// model used elsewhere: rate(b) = solo / (1 + k·b). The measured observed decode
+// rate (when present) is unwound from the current batch to a solo rate and then
+// reapplied at b+1; otherwise the static benchmark is the solo proxy. Used by the
+// decode-floor quality preference (PendingRequest.MinDecodeTPS).
+func projectedPerRequestDecodeTPS(snap routingSnapshot) float64 {
+	k := effectiveTPSLoadFactor
+	if k < 0 {
+		k = 0
+	}
+	b := snap.backendRunning
+	if b < 0 {
+		b = 0
+	}
+	solo := snap.decodeTPS
+	if snap.observedDecodeTPS > 0 {
+		solo = snap.observedDecodeTPS * (1 + k*float64(b)) // unwind measured@b to solo (b=0)
+	}
+	if solo <= 0 {
+		return 0
+	}
+	return solo / (1 + k*float64(b+1))
 }
 
 func providerModelIDs(p *Provider) []string {
@@ -1290,6 +1365,7 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 				snap.backendRunning = int(slot.NumRunning)
 				snap.backendWaiting = int(slot.NumWaiting)
 				snap.observedDecodeTPS = slot.ObservedDecodeTPS
+				snap.observedPrefillTPS = slot.ObservedPrefillTPS
 				snap.activeTokenBudgetUsed = slot.ActiveTokenBudgetUsed
 				snap.activeTokenBudgetMax = slot.ActiveTokenBudgetMax
 				snap.queuedTokenBudget = slot.QueuedTokenBudget
@@ -1370,7 +1446,7 @@ func ttftMsFromSnapshot(snap routingSnapshot, reqPromptTokens int) float64 {
 	if reqPromptTokens < 0 {
 		reqPromptTokens = 0
 	}
-	prefillTPS := snap.prefillTPS
+	prefillTPS := resolvePrefillTPS(snap)
 	if prefillTPS <= 0 {
 		prefillTPS = 1.0
 	}

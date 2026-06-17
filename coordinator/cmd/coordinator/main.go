@@ -315,6 +315,22 @@ func main() {
 		}
 	}
 
+	// Routing: per-request sustained-decode floor (tokens/sec). The quality bar is
+	// ON BY DEFAULT (15 tok/s) so the scheduler won't pack a provider into a
+	// degraded stream; it softly prefers providers that keep a newly admitted
+	// request at >= this rate (never rejects on its own — falls back to
+	// best-available). Set EIGENINFERENCE_MIN_DECODE_TPS to override; 0 disables.
+	minDecodeTPS := 15.0 // default quality bar
+	if v := os.Getenv("EIGENINFERENCE_MIN_DECODE_TPS"); v != "" {
+		if tps, err := strconv.ParseFloat(v, 64); err == nil && tps >= 0 {
+			minDecodeTPS = tps
+		} else {
+			logger.Warn("invalid EIGENINFERENCE_MIN_DECODE_TPS; using default", "value", v, "default", minDecodeTPS)
+		}
+	}
+	srv.SetMinDecodeTPS(minDecodeTPS)
+	logger.Info("per-request decode floor (quality bar)", "min_decode_tps", minDecodeTPS)
+
 	// Load runtime template manifest from environment variable (optional override).
 	// When configured, providers whose template hashes don't match are excluded from
 	// routing (but not disconnected) and receive feedback about mismatches.
@@ -497,6 +513,12 @@ func main() {
 	// grace window to update to 0.6.0 and attest. Absent config leaves it disabled.
 	if attestor := loadAPNsAttestor(logger); attestor != nil {
 		srv.SetCodeAttestor(attestor)
+		// W5 Fix 2 (2b): seed the code-identity reuse cache from the store (and
+		// wire write-through) so a blue-green deploy / restart doesn't wipe it and
+		// re-push the whole fleet against Apple's ~3/hour/device budget. Durable in
+		// prod (Postgres store; see the store selection above); a no-op only under
+		// the in-memory store fallback.
+		srv.SeedCodeAttestCache(ctx)
 		deadline, err := parseAPNsEnforceAfter()
 		if err != nil {
 			// A non-empty but malformed APNS_ENFORCE_AFTER is an operator error on a
@@ -530,6 +552,10 @@ func main() {
 
 	// Reclaim expired read-cache entries periodically (bounds memory growth).
 	go srv.StartReadCacheJanitor(ctx)
+
+	// Flag any model decoding far below its active-param/hardware class (W8 —
+	// auto-detects the gemma-dense decode bug). Spawns its own panic-safe loop.
+	srv.StartThroughputAnomalyDetector(ctx)
 
 	// HTTP server with graceful shutdown.
 	httpServer := &http.Server{
