@@ -233,6 +233,28 @@ type Server struct {
 	// 0 (off). Set via EIGENINFERENCE_MIN_DECODE_TPS.
 	minDecodeTPS float64
 
+	// servabilityGate enables the smart early-429 admission gate: when
+	// true, a request whose (prompt + max_tokens) cannot fit the model's context
+	// window or any provider's structural token budget is rejected with an
+	// uptime-NEUTRAL 429 + Retry-After at preflight (OpenRouter fails over)
+	// instead of being admitted and failing as an uptime-DAMAGING 5xx. Default
+	// false (behavior-neutral). Set via EIGENINFERENCE_SERVABILITY_GATE=true. See
+	// registry.PredictServable + servability_gate.go. Independent of (and weaker
+	// than) the always-on dispatch-exhausted reclassification of token-budget 5xx
+	// → 429, which fixes the same failure on the actual provider-rejection path.
+	servabilityGate bool
+
+	// prefillKeepaliveInterval enables SSE keepalives during long prefill:
+	// when > 0, a STREAMING request that has been dispatched but not yet produced
+	// its first content chunk commits HTTP 200 and emits ": keepalive" SSE comments
+	// every interval until the first chunk or a terminal error, so OpenRouter's
+	// fetch timeout does not fire and fail us over mid-prefill. The zero value
+	// disables it; production sets it ON (defaultPrefillKeepaliveInterval, 10s, in
+	// cmd/coordinator). 0 keeps the deferred-commit / invisible-failover behavior.
+	// Set via EIGENINFERENCE_PREFILL_KEEPALIVE_INTERVAL (a Go duration). See
+	// prefill_keepalive.go.
+	prefillKeepaliveInterval time.Duration
+
 	// knownRuntimeManifest holds accepted runtime component hashes.
 	// When set, providers whose runtime hashes don't match are marked as
 	// unverified and excluded from routing (but not disconnected).
@@ -1037,6 +1059,22 @@ func (s *Server) SetMinDecodeTPS(tps float64) {
 		tps = 0
 	}
 	s.minDecodeTPS = tps
+}
+
+// SetServabilityGate toggles the smart early-429 admission gate. See the
+// servabilityGate field. Call before serving starts.
+func (s *Server) SetServabilityGate(enabled bool) {
+	s.servabilityGate = enabled
+}
+
+// SetPrefillKeepaliveInterval sets the prefill SSE keepalive cadence.
+// <= 0 disables it. Production enables it by default (see cmd/coordinator). See
+// the prefillKeepaliveInterval field. Call before serving starts.
+func (s *Server) SetPrefillKeepaliveInterval(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.prefillKeepaliveInterval = d
 }
 
 // SetLongPromptThreshold configures the estimated-prompt-token count at/above

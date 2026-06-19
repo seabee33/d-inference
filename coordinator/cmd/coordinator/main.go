@@ -53,6 +53,12 @@ import (
 	ddtracer "gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
+// defaultPrefillKeepaliveInterval is the on-by-default cadence for SSE prefill
+// keepalives. Chosen to sit below typical fetch timeouts while keeping the
+// early-commit blast radius to genuinely long prefills; tune via
+// EIGENINFERENCE_PREFILL_KEEPALIVE_INTERVAL (0 disables).
+const defaultPrefillKeepaliveInterval = 10 * time.Second
+
 func main() {
 	// Structured JSON logging. When Datadog is active, we wrap the handler
 	// with trace context injection so logs correlate with APM traces.
@@ -379,6 +385,44 @@ func main() {
 	}
 	srv.SetMinDecodeTPS(minDecodeTPS)
 	logger.Info("per-request decode floor (quality bar)", "min_decode_tps", minDecodeTPS)
+
+	// Smart early-429 admission gate. OFF by default (behavior-neutral).
+	// When enabled, a request whose (prompt+max_tokens) cannot fit the model
+	// context window or any provider's structural token budget is rejected with an
+	// uptime-neutral 429 at preflight instead of being admitted and 5xx'ing on the
+	// provider. The always-on dispatch-exhausted reclassification of a provider
+	// token-budget 5xx → 429 is independent of this flag.
+	if v := os.Getenv("EIGENINFERENCE_SERVABILITY_GATE"); v != "" {
+		if on, err := strconv.ParseBool(v); err == nil && on {
+			srv.SetServabilityGate(true)
+			logger.Info("smart servability gate ENABLED via EIGENINFERENCE_SERVABILITY_GATE (unservable long prompts → early 429)")
+		} else if err != nil {
+			logger.Warn("invalid EIGENINFERENCE_SERVABILITY_GATE; gate stays off", "value", v)
+		}
+	}
+
+	// SSE keepalives during long prefill. ON by default at a 10s cadence so a long
+	// prefill never leaves the consumer connection idle long enough for OpenRouter's
+	// fetch timeout to fire and fail us over mid-prefill. The first keepalive fires
+	// one interval in, so a STREAMING request that produces its first token quickly
+	// keeps clean deferred-commit / invisible-failover — only genuinely long
+	// prefills commit HTTP 200 early and emit ": keepalive" comments. Override the
+	// cadence (or set 0 to disable) via EIGENINFERENCE_PREFILL_KEEPALIVE_INTERVAL (a
+	// Go duration); tune it below OpenRouter's fetch timeout.
+	prefillKeepalive := defaultPrefillKeepaliveInterval
+	if v := os.Getenv("EIGENINFERENCE_PREFILL_KEEPALIVE_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			prefillKeepalive = d
+		} else {
+			logger.Warn("invalid EIGENINFERENCE_PREFILL_KEEPALIVE_INTERVAL; using default (want a Go duration like 5s, or 0 to disable)", "value", v, "default", defaultPrefillKeepaliveInterval.String())
+		}
+	}
+	srv.SetPrefillKeepaliveInterval(prefillKeepalive)
+	if prefillKeepalive > 0 {
+		logger.Info("prefill SSE keepalives enabled", "interval", prefillKeepalive.String())
+	} else {
+		logger.Info("prefill SSE keepalives disabled")
+	}
 
 	// Load runtime template manifest from environment variable (optional override).
 	// When configured, providers whose template hashes don't match are excluded from
