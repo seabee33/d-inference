@@ -13,6 +13,8 @@ let package = Package(
         .executable(name: "darkbloom", targets: ["darkbloom"]),
         .executable(name: "darkbloom-enclave", targets: ["DarkbloomEnclaveCLI"]),
         .executable(name: "darkbloom-publish", targets: ["darkbloom-publish"]),
+        .executable(name: "kv-quant-gate", targets: ["kv-quant-gate"]),
+        .executable(name: "kv-attn-selftest", targets: ["kv-attn-selftest"]),
     ],
     dependencies: [
         .package(path: "../libs/mlx-swift"),
@@ -174,6 +176,27 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
             ],
             path: "Sources/darkbloom-publish"
+        ),
+
+        .executableTarget(
+            name: "kv-quant-gate",
+            dependencies: [
+                "ProviderCore",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Sources/kv-quant-gate"
+        ),
+
+        .executableTarget(
+            name: "kv-attn-selftest",
+            dependencies: [
+                "ProviderCore",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ],
+            path: "Sources/kv-attn-selftest"
         ),
 
         // ----------------------------------------------------------------
