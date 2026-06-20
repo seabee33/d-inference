@@ -38,17 +38,23 @@ var validInferenceErrorReasons = map[string]struct{}{
 	errorReasonUnknown:            {},
 }
 
-func (s *Server) updateInferenceRouteOutcome(requestID string, attempt int, outcome *store.InferenceRouteOutcome) {
-	s.updateInferenceRouteOutcomeWithModel(requestID, attempt, "", outcome)
-}
-
 func (s *Server) updateInferenceRouteOutcomeWithModel(requestID string, attempt int, model string, outcome *store.InferenceRouteOutcome) {
 	if s == nil || s.store == nil || requestID == "" || outcome == nil {
 		return
 	}
 	s.emitInferenceErrorMetric(model, outcome)
 	s.submitTelemetry("updateInferenceRoute", func() {
-		_ = s.store.UpdateInferenceRouteOutcome(requestID, attempt, outcome)
+		if err := s.store.UpdateInferenceRouteOutcome(requestID, attempt, outcome); err != nil && s.logger != nil {
+			s.logger.Error("inference_routes outcome update failed",
+				"request_id", requestID,
+				"attempt", attempt,
+				"model", model,
+				"final_status", outcome.FinalStatus,
+				"error_class", outcome.ErrorClass,
+				"error_reason", outcome.ErrorReason,
+				"error", err,
+			)
+		}
 	})
 }
 

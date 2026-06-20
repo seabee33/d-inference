@@ -64,6 +64,15 @@ func testPostgresStore(t *testing.T) *PostgresStore {
 	return s
 }
 
+func TestPostgresInferenceRouteErrorReasonUpsertQualifiesTargetColumn(t *testing.T) {
+	if !strings.Contains(inferenceRouteErrorReasonUpsertAssignment, "inference_routes.error_reason") {
+		t.Fatalf("error_reason upsert fallback must qualify target table: %s", inferenceRouteErrorReasonUpsertAssignment)
+	}
+	if strings.Contains(inferenceRouteErrorReasonUpsertAssignment, "), error_reason)") {
+		t.Fatalf("error_reason upsert fallback is ambiguous in ON CONFLICT: %s", inferenceRouteErrorReasonUpsertAssignment)
+	}
+}
+
 func TestPostgresCreateKey(t *testing.T) {
 	s := testPostgresStore(t)
 
@@ -172,7 +181,16 @@ func TestPostgresRecordUsage(t *testing.T) {
 		t.Fatalf("usage records = %d, want 2", len(records))
 	}
 
-	r := records[0]
+	var r *UsageRecord
+	for i := range records {
+		if records[i].ProviderID == "provider-1" {
+			r = &records[i]
+			break
+		}
+	}
+	if r == nil {
+		t.Fatalf("provider-1 usage record missing: %+v", records)
+	}
 	if r.ProviderID != "provider-1" {
 		t.Errorf("provider_id = %q", r.ProviderID)
 	}
@@ -868,8 +886,8 @@ func TestPostgresDeleteProvidersBySerial(t *testing.T) {
 
 	// Owner rows (two sessions, one serial) + a guard row for another account.
 	for _, rec := range []ProviderRecord{
-		{ID: "a", SerialNumber: "SER", AccountID: "acct-1", RegisteredAt: time.Now(), LastSeen: time.Now()},
-		{ID: "guard", SerialNumber: "SER-G", AccountID: "acct-2", RegisteredAt: time.Now(), LastSeen: time.Now()},
+		{ID: "a", Hardware: json.RawMessage(`{}`), Models: json.RawMessage(`[]`), Backend: "vllm_mlx", SerialNumber: "SER", AccountID: "acct-1", RegisteredAt: time.Now(), LastSeen: time.Now()},
+		{ID: "guard", Hardware: json.RawMessage(`{}`), Models: json.RawMessage(`[]`), Backend: "vllm_mlx", SerialNumber: "SER-G", AccountID: "acct-2", RegisteredAt: time.Now(), LastSeen: time.Now()},
 	} {
 		if err := s.UpsertProvider(ctx, rec); err != nil {
 			t.Fatalf("UpsertProvider(%s): %v", rec.ID, err)
@@ -922,7 +940,7 @@ func TestPostgresDeleteProvidersBySerial_WrongOwner(t *testing.T) {
 	s := testPostgresStore(t)
 	ctx := context.Background()
 
-	if err := s.UpsertProvider(ctx, ProviderRecord{ID: "a", SerialNumber: "SER", AccountID: "acct-1", RegisteredAt: time.Now(), LastSeen: time.Now()}); err != nil {
+	if err := s.UpsertProvider(ctx, ProviderRecord{ID: "a", Hardware: json.RawMessage(`{}`), Models: json.RawMessage(`[]`), Backend: "vllm_mlx", SerialNumber: "SER", AccountID: "acct-1", RegisteredAt: time.Now(), LastSeen: time.Now()}); err != nil {
 		t.Fatalf("UpsertProvider: %v", err)
 	}
 
