@@ -1770,6 +1770,14 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 		// window elapsed, hard-untrusted) returns false and falls through to the
 		// unchanged full live MDM verify.
 		if s.tryTrustReuseFastSkip(providerID, provider, resp, statusFieldsTrusted) {
+			// The fast-skip granted hardware WITHOUT running the full live MDM verify,
+			// so verifyAppleDeviceAttestation never ran on this connection. Reuse the
+			// durable MDA proof (re-verified locally against Apple's root + re-bound to
+			// this SE key) so a restart keeps mda_verified green with zero MDM/APNs
+			// traffic — the whole point of the fast-skip is to avoid that round-trip.
+			if ar := provider.GetAttestationResult(); ar != nil {
+				s.attachCachedMDAProof(providerID, provider, *ar)
+			}
 			// DAR-326 FIX 3: the fast-skip just granted hardware, so this provider is
 			// freshly routable — drain any queued requests now instead of waiting for
 			// the next heartbeat / 120s queue timeout. Off the challenge goroutine,
@@ -1788,7 +1796,16 @@ func (s *Server) verifyChallengeResponse(providerID string, provider *registry.P
 			// mdmVerificationLoop (SignalChallengeSettled, so it stops deferring and
 			// runs the live verify) if ACME did NOT grant hardware.
 			s.retryACMETrust(providerID, provider)
-			if provider.GetTrustLevel() != registry.TrustHardware {
+			if provider.GetTrustLevel() == registry.TrustHardware {
+				// ACME granted hardware without the live MDM verify, so
+				// verifyAppleDeviceAttestation (which runs the MDA leg) never fires and
+				// the mdmVerificationLoop exits. Attach the durable MDA proof here too,
+				// or an ACME-trusted reconnect keeps mda_verified=false despite a valid
+				// cached chain.
+				if ar := provider.GetAttestationResult(); ar != nil {
+					s.attachCachedMDAProof(providerID, provider, *ar)
+				}
+			} else {
 				provider.SignalChallengeSettled()
 			}
 		}
@@ -2729,6 +2746,15 @@ func (s *Server) verifyProviderAttestation(providerID string, provider *registry
 		}
 	}
 
+	// Stage the durable Apple MDA cert chain from a LIVE store read. storedProviders
+	// above is a one-time startup snapshot — empty for the coordinator's whole life
+	// under the in-memory store used in prod — so it cannot surface a chain earned
+	// during this coordinator's lifetime. The store record survives provider
+	// disconnect, so a serial lookup recovers a chain a previous connection earned,
+	// letting attachCachedMDAProof reuse it (re-verified + SE-key-bound) instead of
+	// forcing a fresh, Apple-rate-limited DevicePropertiesAttestation round-trip.
+	s.stageDurableMDAChain(provider, result.SerialNumber)
+
 	// Deduplicate: if another provider connection exists from the same physical
 	// device (same serial number), disconnect it. This prevents multiple
 	// provider processes on the same machine from registering independently
@@ -3023,6 +3049,14 @@ func (s *Server) ApplyLateSecurityInfo(udid string, info *mdm.SecurityInfoRespon
 		if seKey != "" && binaryHash != "" {
 			s.recordTrustReuse(c.provider, seKey, c.serial, binaryHash, true /*sip*/, true /*secureBootFull*/, udid)
 		}
+
+		// The late grant earned hardware WITHOUT the synchronous MDM verify (which
+		// runs the MDA leg via verifyAppleDeviceAttestation), so attach the durable
+		// MDA proof here too — otherwise a provider upgraded via late SecurityInfo
+		// stays mda_verified=false despite a valid cached chain.
+		if ar := c.provider.GetAttestationResult(); ar != nil {
+			s.attachCachedMDAProof(c.provider.ID, c.provider, *ar)
+		}
 	}
 }
 
@@ -3122,9 +3156,111 @@ func (s *Server) mdmVerificationLoop(ctx context.Context, providerID string, pro
 	}
 }
 
+// stageDurableMDAChain recovers a previously-earned Apple MDA cert chain from the
+// store (by serial) and stages it on the provider as a reuse candidate for this
+// reconnect. The store record survives provider disconnect, so this works under
+// the in-memory store used in prod — where the startup storedProviders snapshot is
+// empty — as well as a durable store. Best-effort: a missing record / chain or a
+// read error simply stages nothing, and a fresh attestation is requested.
+func (s *Server) stageDurableMDAChain(provider *registry.Provider, serial string) {
+	if s.store == nil || serial == "" {
+		return
+	}
+	// Bound the store read: this runs on the attestation path, so a slow or
+	// unavailable Postgres must not stall it — on timeout we skip staging and fall
+	// back to a fresh attestation.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// Newest NON-EMPTY chain for this serial: a reconnect persists a new row that
+	// may briefly carry an empty chain (async persists race the reattach), which
+	// would shadow a still-valid chain via a plain by-serial lookup. This looks
+	// past those empty rows.
+	chain, err := s.store.GetMDAChainBySerial(ctx, serial)
+	if err != nil || len(chain) == 0 {
+		return
+	}
+	provider.StageMDAChainFromJSON(chain)
+}
+
+// attachCachedMDAProof tries to satisfy the Apple Device Attestation (MDA) leg
+// from the durable cert chain restored on reconnect, WITHOUT a fresh
+// DevicePropertiesAttestation round-trip. Apple rate-limits a fresh attestation to
+// ≈1/device/7d and it rides the same throttled MicroMDM→APNs channel as
+// SecurityInfo, so re-fetching on every reconnect is the reason restarted
+// providers show "Apple Device Attestation incomplete". The cached chain is
+// re-verified here against Apple's pinned Enterprise Attestation Root CA (an
+// expired or tampered chain is rejected) and re-bound to THIS connection's SE key
+// via the FreshnessCode OID (anti-relay). Returns true if a valid, bound proof was
+// attached — which requires the provider to already hold hardware trust.
+func (s *Server) attachCachedMDAProof(providerID string, provider *registry.Provider, attestResult attestation.VerificationResult) bool {
+	chain := provider.StagedMDAChain()
+	if len(chain) == 0 {
+		return false
+	}
+	mdaResult, err := attestation.VerifyMDADeviceAttestation(chain)
+	if err != nil || mdaResult == nil || !mdaResult.Valid {
+		// Chain no longer verifies (expired / not Apple-signed) — fall through to a
+		// fresh request.
+		return false
+	}
+
+	// Cached reuse REQUIRES the strong SE-key binding: the FreshnessCode OID in the
+	// Apple-signed chain must equal SHA-256 of THIS connection's SE public key. A
+	// serial-only match is deliberately NOT sufficient to reuse a stored chain — if
+	// the SE key rotated (re-image / keychain reset) the old chain no longer binds
+	// this key, so we fall through to a fresh attestation rather than letting a new
+	// key inherit the prior device's Apple proof. (A live challenge has already
+	// proven possession of this SE key, so the binding is meaningful.)
+	if attestResult.PublicKey == "" || len(mdaResult.FreshnessCode) == 0 {
+		return false
+	}
+	// INVARIANT: this must use the exact same input as the fresh path's nonce
+	// (verifyAppleDeviceAttestation computes expectedFreshness = sha256([]byte(
+	// attestResult.PublicKey)) and sends its base64 as the DeviceAttestationNonce).
+	// Apple echoes the decoded nonce as the FreshnessCode, so a chain earned fresh
+	// has FreshnessCode == this digest. Keep the two formulas identical.
+	want := sha256.Sum256([]byte(attestResult.PublicKey))
+	if !bytes.Equal(mdaResult.FreshnessCode, want[:]) {
+		return false
+	}
+	// Defense in depth: when Apple included a serial, it must match this machine's
+	// attested serial (privacy-enrolled chains omit the serial — the SE-key binding
+	// above carries the proof in that case).
+	if mdaResult.DeviceSerial != "" && mdaResult.DeviceSerial != attestResult.SerialNumber {
+		return false
+	}
+
+	if !provider.SetMDAProofIfHardwareBound(chain, mdaResult, true) {
+		// Not hardware-trusted (yet) — nothing to attach the proof to.
+		return false
+	}
+	// Persist immediately under THIS connection's record. The grant-path
+	// PersistProvider ran before this attach, so without this write the new
+	// session's row would carry an empty mda_cert_chain until the next throttled
+	// heartbeat — and a disconnect in that window would lose the chain (serial now
+	// indexes this session's row), forcing a fresh, rate-limited refetch on the
+	// next reconnect. Mirrors the fresh-MDA path's immediate persist.
+	s.registry.PersistProvider(provider)
+	s.logger.Info("MDA reused from durable cert chain — skipped fresh DevicePropertiesAttestation",
+		"provider_id", providerID,
+		"mda_serial", mdaResult.DeviceSerial,
+		"se_key_bound", true,
+	)
+	s.ddIncr("mda.verification", []string{"outcome:reused"})
+	return true
+}
+
 // verifyAppleDeviceAttestation sends a DeviceInformation command requesting
 // DevicePropertiesAttestation and verifies the Apple-signed certificate chain.
 func (s *Server) verifyAppleDeviceAttestation(ctx context.Context, providerID string, provider *registry.Provider, attestResult attestation.VerificationResult, udid string) {
+	// Fast path: reuse a still-valid, SE-key-bound Apple attestation recovered from
+	// the durable store instead of requesting a fresh one. This skips the
+	// rate-limited APNs round-trip entirely on reconnect/restart and is what keeps
+	// mda_verified green across a provider restart.
+	if s.attachCachedMDAProof(providerID, provider, attestResult) {
+		return
+	}
+
 	if udid == "" {
 		s.logger.Warn("no UDID for MDA verification", "provider_id", providerID)
 		return
@@ -3217,6 +3353,15 @@ func (s *Server) verifyAppleDeviceAttestation(ctx context.Context, providerID st
 	provider.MDAResult = mdaResult
 	provider.SEKeyBound = seKeyBound
 	provider.Mu().Unlock()
+
+	// Persist the freshly-earned chain NOW so it is durable for reuse. The
+	// hardware-grant PersistProvider ran before this MDA leg, so without an explicit
+	// write here the chain would only reach the store on the next throttled
+	// heartbeat persist — and would be lost (and re-fetched, hitting Apple's
+	// ~1/device/7d rate limit) if the provider disconnects in that window. With a
+	// durable (Postgres) store this is what makes the proof recoverable across a
+	// coordinator restart.
+	s.registry.PersistProvider(provider)
 
 	// Log results.
 	if seKeyNonce != "" && len(mdaResult.FreshnessCode) > 0 {
